@@ -32,6 +32,32 @@ v3 changes (driven by the "Worksheet structure" README):
      positional indices inside the workflow, NOT worksheet row ids.
   6. Focus view (hide rows empty across the visible columns), README §9.
 
+v4 changes:
+  1. EXACT project search - a dedicated search box filters the Project list by
+     LITERAL contiguous substring ('1313' proposes 'MO13137', never '1-31-3',
+     '13 13' or a lone '13'); Streamlit's fuzzy dropdown matching no longer
+     decides what is proposed.
+  2. 'Only my projects' now shows every project where the user is a
+     collaborator in ANY role (my_role union), not only the projects they own
+     (the search API's myProject flag).
+  3. Interval 1 / Interval 2 in the DT panel are MULTI-selects: several
+     setpoints of one axis parameter can be combined; empty = (any). Each axis
+     only ever offers its own parameter's setpoints (axis identity comes from
+     the workflow's intervalString), so parameters cannot be mixed.
+  4. The Advanced filter's 'Results' Section entry is labelled INACTIVE until
+     the Results table has been downloaded.
+  5. 'Display' menu (like Albert's) - shows/hides the sheet's Blank / Lookup /
+     Function / Result columns, which are now extracted from the Product grid.
+  6. Reliable row tick boxes - editor state is keyed to the visible row set
+     and synced via on_change, and programmatic selection changes clear the
+     editor's positional deltas.
+  7. The XLSX download reproduces the on-screen tables 1:1 (row filters,
+     ticked rows, hidden columns, Display menu, merged vs non-merged cells per
+     table, Decimals).
+  8. The Results load controls (include-filtered-out, tidy view, aggregation,
+     Load Data / Reload / parallel requests, load plan) moved between
+     'Selection of Data Templates in Results' and the Advanced filter.
+
 Requirements:
     pip install streamlit albert pandas truststore openpyxl
 
@@ -46,6 +72,7 @@ import truststore
 
 truststore.inject_into_ssl()
 
+import hashlib
 import io
 import os
 import re
@@ -260,20 +287,46 @@ st.header("1️⃣ Projects & sheets")
 
 PROJECT_CATALOG_MAX = 5000
 
+# Every ACL role a user can hold on a project (SDK AccessControlLevel).
+# 'Only my projects' must show every project where the user was added as a
+# collaborator REGARDLESS of the assigned role - but the search API's
+# myProject flag only returns projects the user OWNS. So ownership and
+# membership-in-any-role are queried separately and unioned.
+PROJECT_MEMBER_ROLES = [
+    "ProjectOwner",
+    "ProjectEditor",
+    "ProjectViewer",
+    "ProjectAllTask",
+    "ProjectStrictViewer",
+    "ProjectPropertyTask",
+]
+
 
 @st.cache_data(ttl=600, show_spinner="Loading the project list from Albert...")
 def load_project_catalog(_client: Albert, only_mine: bool) -> dict[str, str]:
     """label -> project id for the Project type-ahead. The label carries BOTH
     the description and the id ('<description>  [<id>]'), so typing any part
-    of either filters the dropdown. `only_mine` maps to the search API's
-    my_project flag (projects where the user is a member). Cached for 10 min
-    per flag value."""
+    of either filters the dropdown. `only_mine` unions the search API's
+    my_project flag (projects the user OWNS) with a my_role query over every
+    project role (projects where the user is a collaborator in ANY role).
+    Cached for 10 min per flag value."""
     out: dict[str, str] = {}
-    for p in _client.projects.search(
-        my_project=True if only_mine else None,
-        max_items=PROJECT_CATALOG_MAX,
-    ):
-        out[f"{p.description or '(no description)'}  [{p.id}]"] = p.id
+
+    def _collect(**kw) -> None:
+        for p in _client.projects.search(max_items=PROJECT_CATALOG_MAX, **kw):
+            out.setdefault(f"{p.description or '(no description)'}  [{p.id}]", p.id)
+
+    if only_mine:
+        _collect(my_project=True)  # projects the user owns
+        try:
+            _collect(my_role=PROJECT_MEMBER_ROLES)  # collaborator, any role
+        except Exception as e:  # noqa: BLE001
+            st.warning(
+                "Could not load the projects where you are a collaborator - "
+                f"showing only the projects you own: {e}"
+            )
+    else:
+        _collect()
     return out
 
 
@@ -292,7 +345,9 @@ pc1, pc2 = st.columns([3, 1])
 with pc2:
     only_mine = st.checkbox(
         "Only my projects",
-        help="Suggest only projects where you are a member.",
+        help="Suggest only projects where you are a member: projects you OWN "
+        "plus every project where you were added as a collaborator, whatever "
+        "the role (Editor, Viewer, All Tasks, Strict Viewer, Property Tasks).",
     )
 
 try:
@@ -324,16 +379,35 @@ _proj_options = [
 ] + list(proj_catalog)
 
 with pc1:
+    # EXACT (contiguous) search box. Streamlit's own dropdown type-ahead does
+    # FUZZY matching - typing '1313' also proposes '1-31-3', '13 13' or a lone
+    # '13' because it matches the characters in order but not necessarily
+    # adjacent. This box pre-filters the options with a literal substring
+    # test, so only projects whose ID or description contains '1313'
+    # contiguously are proposed. Already-selected projects always stay in the
+    # option list so their chips never break.
+    proj_query = st.text_input(
+        "Search project (exact match)",
+        key="proj_search",
+        placeholder="e.g. 1313 → only projects containing '1313' together",
+        help="Literal, contiguous match on the project ID or description: "
+        "'1313' proposes 'MO13137' but never '1-31-3', '13 13' or a lone '13'.",
+    )
+    _q = proj_query.strip().lower()
+    if _q:
+        _selected_now = set(st.session_state[_PROJ_KEY])
+        _proj_options = [
+            l for l in _proj_options if _q in l.lower() or l in _selected_now
+        ]
     sel_proj_labels = st.multiselect(
         "Project",
         _proj_options,
         key=_PROJ_KEY,
-        placeholder="Type a project ID or description to search...",
-        help="Type any part of the project ID (e.g. '13137', 'MO13', '137') or "
-        "of its description (e.g. 'second', 'dispers') - the dropdown suggests "
-        "every match. Pick one, then type again to search and add the next "
-        "project: every selected project joins the comparison. Remove one with "
-        "the ✕ on its chip.",
+        placeholder="Pick a project (use the search box above to narrow the list)...",
+        help="Use the search box above for an exact (contiguous) match, then "
+        "pick the project here. Repeat the search to add the next project: "
+        "every selected project joins the comparison. Remove one with the ✕ "
+        "on its chip.",
     )
 st.session_state["proj_basket"] = sel_proj_labels
 
@@ -553,24 +627,46 @@ def extract_sheet(_sheet, sheet_key: str) -> dict:
         if getattr(f, "id", None)
     }
 
+    # Worksheet "Display" column types (Albert's Display dropdown): Blank,
+    # Lookup, Function and Result columns. They carry NO inventory_id, so they
+    # are keyed by a per-sheet column key ('COL::<sheet>::<colId>') instead -
+    # unique across a multi-sheet comparison.
+    DISPLAY_TYPES = ("BLK", "LKP", "FNC", "RSL")
+
     columns = []
     for c in _sheet.columns:
         name = getattr(c, "name", None) or ""
+        inv_id = getattr(c, "inventory_id", None)
+        cid = getattr(c, "column_id", None)
+        tcode = str(getattr(c, "type", "") or "").split(".")[-1]
+        col_key = inv_id or (
+            f"COL::{sheet_key}::{cid}" if cid and tcode in DISPLAY_TYPES else None
+        )
         columns.append(
             {
-                "column_id": getattr(c, "column_id", None),
+                "column_id": cid,
                 "name": name,
                 "type": str(getattr(c, "type", "") or ""),
-                "inventory_id": getattr(c, "inventory_id", None),
+                "inventory_id": inv_id,
+                "col_key": col_key,
                 "hidden": bool(getattr(c, "hidden", False)),
                 "locked": bool(getattr(c, "locked", False)),
                 "pinned": getattr(c, "pinned", None),
-                "formulation_name": inv_to_form_name.get(getattr(c, "inventory_id", None), ""),
+                "formulation_name": inv_to_form_name.get(inv_id, ""),
                 # The sheet's built-in label column duplicates the row names -
                 # exclude it from the data columns.
                 "is_label_col": name.strip().lower() == "name",
             }
         )
+
+    # column_id -> COL key of the special (Display) columns. Sheet.columns IS
+    # product_design.columns, so the map only applies to the Product grid -
+    # column_ids of other designs are not comparable (see FIX below).
+    special_key_of = {
+        c["column_id"]: c["col_key"]
+        for c in columns
+        if c["col_key"] and not c["inventory_id"] and c["column_id"]
+    }
 
     sections = []
     for attr, label in SECTION_ORDER:
@@ -624,6 +720,9 @@ def extract_sheet(_sheet, sheet_key: str) -> dict:
                 inv = design_col_inv.get(cid)
                 if inv:
                     values[inv] = _cell_text(cell)
+                elif attr == "product_design" and cid in special_key_of:
+                    # Blank / Lookup / Function / Result column cell (Display menu)
+                    values[special_key_of[cid]] = _cell_text(cell)
             path_ids = list(row_paths.get(rid, []))  # [ancestor rowIds, outer->inner]
             rows.append(
                 {
@@ -1466,9 +1565,9 @@ for _i in range(_dtsel_count):
                 "Data Columns", [], key=f"dtsel::{_i}::dc_ph", disabled=True
             )
         with _cols[2]:
-            st.selectbox("Interval 1", [ADV_ANY], key=f"dtsel::{_i}::iv1_ph", disabled=True)
+            st.multiselect("Interval 1", [], key=f"dtsel::{_i}::iv1_ph", disabled=True)
         with _cols[3]:
-            st.selectbox("Interval 2", [ADV_ANY], key=f"dtsel::{_i}::iv2_ph", disabled=True)
+            st.multiselect("Interval 2", [], key=f"dtsel::{_i}::iv2_ph", disabled=True)
         continue
     _dt_id = _dt_label_of[_lbl]
 
@@ -1497,8 +1596,14 @@ for _i in range(_dtsel_count):
             "unit ids). Defaults to every non-hidden data column.",
         )
 
+    # MULTI-SELECT per interval axis. Each axis only ever offers the setpoints
+    # of the parameter the workflow assigns to that axis position (axis 1 =
+    # first segment of intervalString, e.g. Time; axis 2 = second, e.g. Speed)
+    # - so several setpoints of the SAME parameter can be combined, and mixing
+    # parameters across axes is impossible by construction. An EMPTY selection
+    # means '(any)': the axis is not filtered.
     _axes = dt_interval_axes(_dt_id)
-    _iv_sel: list[str] = []
+    _iv_sel: list[list[str]] = []
     for _ax_i in (0, 1):
         _ax = _axes[_ax_i] if _ax_i < len(_axes) else None
         _has = bool(_ax and _ax["values"])
@@ -1508,14 +1613,16 @@ for _i in range(_dtsel_count):
             else f"Interval {_ax_i + 1}"
         )
         with _cols[2 + _ax_i]:
-            _v = _safe_selectbox(
+            _v = _safe_multiselect(
                 _iv_label,
-                ([ADV_ANY] + _ax["values"]) if _has else [ADV_ANY],
+                _ax["values"] if _has else [],
                 key=f"dtsel::{_i}::iv{_ax_i + 1}",
                 disabled=not _has,
+                placeholder=ADV_ANY,
                 help=(
-                    "Setpoints unioned across every workflow this Data Template "
-                    f"occurs on. '{ADV_ANY}' = don't filter this axis."
+                    "Pick ANY NUMBER of setpoints on this axis (unioned across "
+                    "every workflow this Data Template occurs on). Leave it "
+                    f"empty for '{ADV_ANY}' - no filter on this axis."
                     if _has
                     else "This Data Template has no interval on this axis."
                 ),
@@ -1563,6 +1670,122 @@ if _dtsel_count > 0:
 st.session_state["dt_selectors"] = dt_selectors
 
 
+# ===========================================================================
+# 4c-bis) RESULTS LOAD CONTROLS - these used to sit above the Results table;
+#     they now live HERE, between "Selection of Data Templates in Results"
+#     and the Advanced filter. Only the CONTROLS moved: the actual fetch (the
+#     progress bar) and the Results table itself still happen in the Results
+#     section below, on the same run.
+# ===========================================================================
+include_foreign = False
+long_view = False
+_load_clicked = False
+target_tasks: dict[str, dict] = {}
+_results_to_fetch: list[dict] = []
+loaded_recs: list[dict] = []
+results_store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
+
+if section_by_attr.get("result_design"):
+    _rc1, _rc2 = st.columns(2)
+    with _rc1:
+        include_foreign = st.checkbox(
+            "Include experiments filtered out / from other sheets",
+            value=False,
+            help="A Property Task can hold data for experiments hidden by the "
+            "filters above or living on another sheet.",
+        )
+    with _rc2:
+        long_view = st.checkbox("Long (tidy) view instead of pivot", value=False)
+
+    agg_choice = st.radio(
+        "Repeated measurements per property",
+        ["List all values (6.12 | 6.65 | 5.71)", "Average"],
+        horizontal=True,
+        key="agg::results",
+        help="When one property has several measurements for the same experiment, "
+        "either list every value or show their numeric average. Applies to the pivot "
+        "view on screen and to the XLSX / CSV (pivot) downloads.",
+    )
+    st.session_state["results_agg_mode"] = "avg" if agg_choice == "Average" else "list"
+
+    # --- Load plan: union of the tasks behind every configured DT row ---------
+    for _sel in dt_selectors:
+        for _o in dt_index.get(_sel["dt_id"], {}).get("occurrences", []):
+            target_tasks.setdefault(
+                _o["task_id"], {"id": _o["task_id"], "name": _o["task_name"]}
+            )
+    _results_to_fetch = [t for tid, t in target_tasks.items() if tid not in results_store]
+
+    if not dt_selectors:
+        st.info(
+            "Configure at least one Data Template in **Selection of Data "
+            "Templates in Results** above - then press Load Data."
+        )
+
+    _lc1, _lc2, _lc3 = st.columns([1.5, 1.6, 1.2])
+    with _lc1:
+        _load_clicked = st.button(
+            f"⬇️ Load Data ({len(target_tasks)} task(s))",
+            type="primary",
+            disabled=not target_tasks,
+            help="Downloads property data ONLY for the tasks where the selected "
+            "Data Templates occur (already-loaded tasks are reused from cache). "
+            "Data Column / interval choices filter the display and cost nothing.",
+        )
+    with _lc2:
+        _reload_clicked = st.button(
+            "🔄 Reload (discard caches)",
+            disabled=not target_tasks,
+            help="Busts the DT/task index, the Data Template definitions, the "
+            "workflow interval cache and the results store, then re-fetches.",
+        )
+    with _lc3:
+        st.session_state["fetch_workers"] = st.number_input(
+            "Parallel requests",
+            min_value=1,
+            max_value=48,
+            value=int(st.session_state.get("fetch_workers", 16)),
+            step=4,
+            help="Size of the flat request pool. Load Data issues one request per "
+            "block x inventory combo of the SELECTED Data Templates, across all "
+            "target tasks at once. Raising this shortens the load; back off on errors.",
+        )
+
+    if _reload_clicked:
+        st.session_state["dt_cache_bust"] = int(st.session_state.get("dt_cache_bust", 0)) + 1
+        load_property_task_catalog.clear()
+        load_dt_definition.clear()
+        st.session_state["wf_intervals"] = {}
+        st.session_state["wf_unresolved"] = {}
+        st.session_state[RESULTS_STORE_KEY] = {}
+        st.rerun()
+
+    _loaded_n_ctrl = sum(1 for _tid in target_tasks if _tid in results_store)
+    if dt_selectors and not _loaded_n_ctrl:
+        st.caption("No property data loaded yet - press **Load Data**.")
+
+    # --- Diagnostics: how the DT-first index maps to the load plan ------------
+    with st.expander("🔧 DT index & Load plan (DataTemplate-first)"):
+        st.write("**dt_index** (from `tasks.get_all` inline Blocks - zero property data):")
+        st.json(dt_index, expanded=False)
+        if dt_selectors:
+            st.write("**Resolved interval axes per configured DT:**")
+            st.write(
+                {
+                    f"{_sel['dt_name']} ({_sel['dt_id']})": [
+                        {"axis": i + 1, "parameters": ax["names"], "values": ax["values"]}
+                        for i, ax in enumerate(_sel["axes"])
+                    ]
+                    or "(no intervals on any workflow)"
+                    for _sel in dt_selectors
+                }
+            )
+        st.write(
+            "**Tasks that Load Data will fetch** (union across DT rows, deduped):",
+            sorted(target_tasks),
+        )
+
+
 def _adv_row_value(row: dict, field: str) -> str:
     """Value of a cascade field (Name / Group / Subgroup n) for a Product/Process row."""
     if field == "Name":
@@ -1593,15 +1816,6 @@ if section_by_attr.get("result_design"):
 if section_by_attr.get("process_design"):
     _adv_section_fields["process_design"] = ["Name", "Group"]
 
-_adv_labels = {
-    "product_design": "Product Design",
-    "result_design": "Results",
-    "process_design": "Process Design",
-}
-_adv_label_to_attr = {
-    _adv_labels[a]: a for a in _adv_labels if a in _adv_section_fields
-}
-
 # Loaded Results records (populated lazily lower on the page; persist across reruns).
 _adv_result_records = [
     r
@@ -1609,6 +1823,22 @@ _adv_result_records = [
     for r in recs
     if isinstance(r, dict) and "__error__" not in r
 ]
+
+# The 'Results' entry of the Section dropdown is shown as INACTIVE until the
+# Results table has actually been downloaded (Load Data pressed): a native
+# selectbox cannot grey out one option, so the state is written into the
+# label itself. Once data arrives the label flips back to plain 'Results'
+# (and _safe_selectbox resets any stale choice of the inactive label).
+_results_loaded = bool(_adv_result_records)
+_RESULTS_INACTIVE_LABEL = "Results  (inactive - press Load Data first)"
+_adv_labels = {
+    "product_design": "Product Design",
+    "result_design": "Results" if _results_loaded else _RESULTS_INACTIVE_LABEL,
+    "process_design": "Process Design",
+}
+_adv_label_to_attr = {
+    _adv_labels[a]: a for a in _adv_labels if a in _adv_section_fields
+}
 
 adv_specs: list[dict] = []
 
@@ -1918,6 +2148,61 @@ with o4:
         "available as a tooltip on each column header.",
     )
 
+# --- 'Display' menu: reproduces the worksheet's Display dropdown -------------
+# Albert's worksheet has a 'Display' button that shows/hides the Blank, Lookup,
+# Function and Result COLUMNS. Those columns carry no inventory_id (they are
+# not formulations), so they were previously dropped entirely; they are now
+# captured from the Product Design grid and toggled here per type.
+DISPLAY_COL_LABELS = {
+    "BLK": "Blank columns",
+    "LKP": "Lookup columns",
+    "FNC": "Function columns",
+    "RSL": "Result columns",
+}
+special_cols_all = [
+    c
+    for c in columns
+    if (c.get("col_key") or "").startswith("COL::")
+    and str(c["type"]).split(".")[-1] in DISPLAY_COL_LABELS
+    and (show_hidden or not c["hidden"])
+]
+_display_present = [
+    lab
+    for code, lab in DISPLAY_COL_LABELS.items()
+    if any(str(c["type"]).split(".")[-1] == code for c in special_cols_all)
+]
+if _display_present:
+    display_sel = _safe_multiselect(
+        "Display",
+        _display_present,
+        key="display_cols",
+        default=_display_present,
+        help="Reproduces the worksheet's **Display** menu: choose which of the "
+        "sheet's Blank / Lookup / Function / Result columns are shown in the "
+        "tables (and in the XLSX download). They appear after the experiment "
+        "columns, labelled with their column type.",
+    )
+else:
+    display_sel = []
+    st.caption("Display: this sheet has no Blank / Lookup / Function / Result columns.")
+visible_special_cols = [
+    c
+    for c in special_cols_all
+    if DISPLAY_COL_LABELS[str(c["type"]).split(".")[-1]] in display_sel
+]
+
+special_tuples: list[tuple[str, str]] = []
+for _c in visible_special_cols:
+    _code = _c["name"] or _c["column_id"] or "column"
+    if _code in _seen_codes:  # shares the uniqueness pool with the experiment codes
+        _seen_codes[_code] += 1
+        _code = f"{_code} ({_seen_codes[_code]})"
+    else:
+        _seen_codes[_code] = 1
+    _lab = DISPLAY_COL_LABELS[str(_c["type"]).split(".")[-1]].rstrip("s")
+    _origin = _c.get("origin") or ""
+    special_tuples.append((_code, _lab + (f"  ·  {_origin}" if _origin else "")))
+
 
 def hier_cols_for(section: dict) -> list[str]:
     """['Group', 'Subgroup 1', ..., 'Subgroup n'] sized to this section's tree."""
@@ -1982,9 +2267,11 @@ def rows_dataframe(
             rec["Row type"] = r["type"]
         for c, t in zip(visible_cols, col_tuples):
             rec[t] = vals[c["inventory_id"]]
+        for c, t in zip(visible_special_cols, special_tuples):
+            rec[t] = r["values"].get(c["col_key"], "")
         recs.append(rec)
         rids.append(str(r["row_id"]))
-    df = pd.DataFrame(recs).reindex(columns=kcols + col_tuples).fillna("")
+    df = pd.DataFrame(recs).reindex(columns=kcols + col_tuples + special_tuples).fillna("")
     return (df, rids) if with_ids else df
 
 
@@ -2151,6 +2438,15 @@ def show_df(
     # ---- controls -----------------------------------------------------------
     # The three row-selection buttons are kept tight together on the left; the
     # view controls (freeze / merge / hide / full screen) follow after a gap.
+    def _clear_editor_state() -> None:
+        """Drop this table's data_editor widget state. The editor stores the
+        user's clicks as POSITIONAL deltas against the input frame; when the
+        selection is changed programmatically (Select all / Unselect all /
+        Apply) those stale deltas would fight the new input - the checkbox
+        appears to bounce back, which is exactly the 'hard to tick' symptom."""
+        for _k in [k for k in st.session_state if str(k).startswith(f"ed::{table_key}")]:
+            del st.session_state[_k]
+
     b1, b2, b3, _gap, c_fz, c_mg, c_hide, c_full = st.columns(
         [1, 1, 1, 0.4, 1.3, 1.0, 2.0, 0.9]
     )
@@ -2159,21 +2455,24 @@ def show_df(
             for rid in row_ids:
                 sel[rid] = True
             st.session_state[applied_key] = False  # bring every row back into view
+            _clear_editor_state()
             st.rerun()
     with b2:
         if st.button("Unselect all", key=f"ua::{table_key}"):
             for rid in row_ids:
                 sel[rid] = False
+            _clear_editor_state()
             st.rerun()
     with b3:
         if st.button("Apply selection", key=f"ap::{table_key}", type="primary"):
             st.session_state[applied_key] = True
+            _clear_editor_state()
             st.rerun()
     with c_fz:
         freeze = st.number_input(
             "Freeze columns",
             min_value=0,
-            max_value=len(key_labels) + len(col_tuples),
+            max_value=len(key_labels) + len(col_tuples) + len(special_tuples),
             value=len(key_labels),
             step=1,
             key=f"fz::{table_key}",
@@ -2192,7 +2491,7 @@ def show_df(
     # merged views. The dropdown lists EVERY column - the key columns (Group /
     # Subgroup / Name / ...) as well as the experiment columns - so any of them can
     # be hidden.
-    hideable = list(key_labels) + [t[0] for t in col_tuples]
+    hideable = list(key_labels) + [t[0] for t in col_tuples + special_tuples]
     with c_hide:
         hidden_cols = st.multiselect(
             "Hide columns",
@@ -2229,14 +2528,14 @@ def show_df(
         head["✓"] = False
         head[key_labels[0]] = "Description"
         head["__rid__"] = "__desc__"
-        for code, desc in col_tuples:
+        for code, desc in col_tuples + special_tuples:
             if code in disp.columns:
                 head[code] = desc
         disp = pd.concat([pd.DataFrame([head]), disp], ignore_index=True)
 
     # ---- decimals: round the experiment (value) columns for display ----------
     if DECIMALS is not None:
-        for _code, _ in col_tuples:
+        for _code, _ in col_tuples + special_tuples:
             if _code in disp.columns:
                 disp[_code] = disp[_code].map(lambda x: _apply_decimals_text(x, DECIMALS))
 
@@ -2293,28 +2592,59 @@ def show_df(
         "__rid__": None,  # hidden
     }
     for i, c in enumerate([x for x in ordered if x != "✓"], start=1):
-        desc = next((d for code, d in col_tuples if code == c), None)
+        desc = next((d for code, d in col_tuples + special_tuples if code == c), None)
         cfg[c] = st.column_config.Column(label=c, help=desc or None, pinned=i <= freeze)
+
+    # RELIABLE TICK BOXES. Two flakiness sources are removed here:
+    #   1. The editor stores clicks as POSITIONAL deltas - if the visible row
+    #      set changes (filters, Apply) under a fixed widget key, old deltas
+    #      land on the WRONG rows. The key therefore embeds a signature of the
+    #      row order, so a changed row set always gets a fresh editor.
+    #   2. Ticks were previously read back AFTER rendering, one run behind the
+    #      click. An on_change callback now writes each click into the
+    #      selection store BEFORE the rerun rebuilds the table, so a single
+    #      click always sticks.
+    _order = [str(x) for x in disp["__rid__"]]
+    _sig = hashlib.md5(("\x1f".join(_order) + f"::{int(bool(applied))}").encode()).hexdigest()[:10]
+    ed_key = f"ed::{table_key}::{_sig}"
+    ord_key = f"edorder::{table_key}"
+    st.session_state[ord_key] = _order
+    # a changed signature orphans the previous editor state - prune it
+    for _k in [
+        k
+        for k in st.session_state
+        if str(k).startswith(f"ed::{table_key}::") and k != ed_key
+    ]:
+        del st.session_state[_k]
+
+    def _sync_ticks(_ed_key=ed_key, _sel_key=sel_key, _ord_key=ord_key) -> None:
+        state = st.session_state.get(_ed_key)
+        order = st.session_state.get(_ord_key) or []
+        if not isinstance(state, dict):
+            return
+        sel_map = st.session_state.setdefault(_sel_key, {})
+        for pos, delta in (state.get("edited_rows") or {}).items():
+            try:
+                p = int(pos)
+            except (TypeError, ValueError):
+                continue
+            if "✓" in delta and 0 <= p < len(order) and order[p] != "__desc__":
+                sel_map[order[p]] = bool(delta["✓"])
 
     # Only pass an explicit height for the full-screen view; omitting it lets the
     # grid auto-size (passing height=None raises on some Streamlit versions).
     editor_kwargs: dict[str, Any] = {"height": 800} if full else {}
-    edited = st.data_editor(
+    st.data_editor(
         disp,
         use_container_width=True,
         hide_index=True,
         column_config=cfg,
         column_order=ordered,
         disabled=[c for c in ordered if c != "✓"],
-        key=f"ed::{table_key}",
+        key=ed_key,
+        on_change=_sync_ticks,
         **editor_kwargs,
     )
-
-    # persist ticks (ignore the synthetic description row)
-    for _, r in edited.iterrows():
-        rid = r.get("__rid__")
-        if rid and rid != "__desc__":
-            sel[rid] = bool(r["✓"])
 
 
 # ===========================================================================
@@ -2612,17 +2942,17 @@ def _dt_selector_passes(r: dict, sels: list[dict]) -> bool:
       * its (task_id, block_id) is an occurrence of that row's DT (block ids
         repeat across tasks, so the PAIR is matched, never block_id alone);
       * its data column is among the row's selected Data Columns;
-      * its resolved Interval 1 / Interval 2 equal the row's choices
-        ('(any)' = no constraint on that axis).
+      * its resolved Interval 1 / Interval 2 is among the row's selected
+        setpoints (iv1/iv2 are MULTI-selections; an empty list = '(any)').
     Requires resolve_intervals() to have run on the record."""
     for s in sels:
         if (r.get("task_id"), r.get("block_id")) not in s["occ"]:
             continue
         if r.get("dc_id") not in s["dc_ids"]:
             continue
-        if s["iv1"] != ADV_ANY and r.get("Interval 1", "") != s["iv1"]:
+        if s["iv1"] and r.get("Interval 1", "") not in s["iv1"]:
             continue
-        if s["iv2"] != ADV_ANY and r.get("Interval 2", "") != s["iv2"]:
+        if s["iv2"] and r.get("Interval 2", "") not in s["iv2"]:
             continue
         return True
     return False
@@ -2795,93 +3125,18 @@ for s in sections:
         continue
 
     # ----- Results: DataTemplate-first. What gets downloaded is defined by the
-    # "Selection of Data Templates in Results" panel in section 2 - here there
-    # is only the Load Data button, the loader and ONE merged table (the old
-    # per-task picker, the Property-Block listing and the Merge-by-DT toggle
-    # are gone; the view is always merged by DT).
-    r1, r2 = st.columns(2)
-    with r1:
-        include_foreign = st.checkbox(
-            "Include experiments filtered out / from other sheets",
-            value=False,
-            help="A Property Task can hold data for experiments hidden by the "
-            "filters above or living on another sheet.",
-        )
-    with r2:
-        long_view = st.checkbox("Long (tidy) view instead of pivot", value=False)
-
-    agg_choice = st.radio(
-        "Repeated measurements per property",
-        ["List all values (6.12 | 6.65 | 5.71)", "Average"],
-        horizontal=True,
-        key=f"agg::{s['attr']}",
-        help="When one property has several measurements for the same experiment, "
-        "either list every value or show their numeric average. Applies to the pivot "
-        "view on screen and to the XLSX / CSV (pivot) downloads.",
-    )
-    st.session_state["results_agg_mode"] = "avg" if agg_choice == "Average" else "list"
-
-    # --- Load plan: union of the tasks behind every configured DT row ---------
-    _sels = st.session_state.get("dt_selectors") or []
-    target_tasks: dict[str, dict] = {}
-    for _sel in _sels:
-        for _o in dt_index.get(_sel["dt_id"], {}).get("occurrences", []):
-            target_tasks.setdefault(
-                _o["task_id"], {"id": _o["task_id"], "name": _o["task_name"]}
-            )
-    store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
-    _to_fetch = [t for tid, t in target_tasks.items() if tid not in store]
-
-    if not _sels:
-        st.info(
-            "Configure at least one Data Template in **Selection of Data "
-            "Templates in Results** (section 2) - then press Load Data here."
-        )
-
-    lc1, lc2, lc3 = st.columns([1.5, 1.6, 1.2])
-    with lc1:
-        _pressed = st.button(
-            f"⬇️ Load Data ({len(target_tasks)} task(s))",
-            type="primary",
-            disabled=not target_tasks,
-            help="Downloads property data ONLY for the tasks where the selected "
-            "Data Templates occur (already-loaded tasks are reused from cache). "
-            "Data Column / interval choices filter the display and cost nothing.",
-        )
-    with lc2:
-        _reload = st.button(
-            "🔄 Reload (discard caches)",
-            disabled=not target_tasks,
-            help="Busts the DT/task index, the Data Template definitions, the "
-            "workflow interval cache and the results store, then re-fetches.",
-        )
-    with lc3:
-        st.session_state["fetch_workers"] = st.number_input(
-            "Parallel requests",
-            min_value=1,
-            max_value=48,
-            value=int(st.session_state.get("fetch_workers", 16)),
-            step=4,
-            help="Size of the flat request pool. Load Data issues one request per "
-            "block x inventory combo of the SELECTED Data Templates, across all "
-            "target tasks at once. Raising this shortens the load; back off on errors.",
-        )
-
-    if _reload:
-        st.session_state["dt_cache_bust"] = int(st.session_state.get("dt_cache_bust", 0)) + 1
-        load_property_task_catalog.clear()
-        load_dt_definition.clear()
-        st.session_state["wf_intervals"] = {}
-        st.session_state["wf_unresolved"] = {}
-        st.session_state[RESULTS_STORE_KEY] = {}
-        st.rerun()
-    if _pressed:
-        if _to_fetch:
-            load_target_results(client, store, _to_fetch)
-        # nothing to fetch -> everything already cached; fall through and render
+    # "Selection of Data Templates in Results" panel in section 2, and ALL the
+    # load controls (checkboxes, aggregation, Load Data / Reload / parallel
+    # requests) also live there now - here only the fetch is executed and ONE
+    # merged table is rendered.
+    _sels = dt_selectors
+    store = results_store
+    if _load_clicked and _results_to_fetch:
+        load_target_results(client, store, _results_to_fetch)
+        # (ends in st.rerun(); nothing to fetch -> fall through and render)
 
     # --- render: ONE table, always merged by DT -------------------------------
-    loaded_recs: list[dict] = []
+    loaded_recs = []
     _errors: list[str] = []
     for _tid in target_tasks:
         for _r in store.get(_tid, []):
@@ -2894,7 +3149,7 @@ for s in sections:
 
     _loaded_n = sum(1 for _tid in target_tasks if _tid in store)
     if _sels and not _loaded_n:
-        st.caption("No property data loaded yet - press **Load Data**.")
+        st.caption("No property data loaded yet - press **Load Data** (section 2).")
     elif _sels:
         st.caption(
             f"Merged view · {_loaded_n} task(s) loaded · one row per "
@@ -2931,27 +3186,8 @@ for s in sections:
                 "|".join(str(mdf.iloc[i][k]) for k in MERGE_DT_KEYS) for i in range(len(mdf))
             ]
             show_df(mdf, MERGE_DT_KEYS, table_key="res::merged_by_dt", row_ids=rids)
-
-    # --- Diagnostics: how the DT-first index maps to the load plan ------------
-    with st.expander("🔧 DT index & Load plan (DataTemplate-first)"):
-        st.write("**dt_index** (from `tasks.get_all` inline Blocks - zero property data):")
-        st.json(dt_index, expanded=False)
-        if _sels:
-            st.write("**Resolved interval axes per configured DT:**")
-            st.write(
-                {
-                    f"{_sel['dt_name']} ({_sel['dt_id']})": [
-                        {"axis": i + 1, "parameters": ax["names"], "values": ax["values"]}
-                        for i, ax in enumerate(_sel["axes"])
-                    ]
-                    or "(no intervals on any workflow)"
-                    for _sel in _sels
-                }
-            )
-        st.write(
-            "**Tasks that Load Data will fetch** (union across DT rows, deduped):",
-            sorted(target_tasks),
-        )
+    # (the DT index & Load plan diagnostics expander moved to section 2, next
+    #  to the load controls)
 
 
 # ===========================================================================
@@ -2970,16 +3206,6 @@ def all_results_df() -> pd.DataFrame:
             df.insert(0, "Property Task", clean[0].get("task_name") or task_id)
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def merged_results_by_dt_df() -> pd.DataFrame:
-    """'Merge Results by DT' pooled across every loaded Property Block: one row per
-    Data Template / Data Column / Interval, experiment columns shared."""
-    store = st.session_state.get(RESULTS_STORE_KEY, {})
-    all_recs: list[dict] = []
-    for recs in store.values():
-        all_recs += [r for r in recs if "__error__" not in r]
-    return results_drilldown_df(all_recs, include_foreign=True, group_keys=MERGE_DT_KEYS)
 
 
 def all_results_long_df() -> pd.DataFrame:
@@ -3013,12 +3239,44 @@ def build_xlsx() -> bytes:
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
+    # --- mirror the ON-SCREEN state of every table ----------------------------
+    # The workbook reproduces the Streamlit tables 1:1 - visible rows (the
+    # per-level row filters + the ticked/applied row selection), visible
+    # columns (each table's 'Hide columns' + the 'Display' menu + the global
+    # filters), MERGED vs NON-MERGED cells (each table's own 'Merge cells'
+    # checkbox) and the Decimals rounding.
+    def _table_key_of(attr: str) -> str:
+        return "res::merged_by_dt" if attr == "result_design" else f"sec::{attr}"
+
+    hidden_of = {
+        s["attr"]: set(st.session_state.get(f"hide::{_table_key_of(s['attr'])}") or [])
+        for s in sections
+    }
+    merge_flag_of = {
+        s["attr"]: bool(st.session_state.get(f"mg::{_table_key_of(s['attr'])}", False))
+        for s in sections
+    }
+
     # --- one key block wide enough for the widest section ---------------------
-    # DataTemplate-first: the Results view is ALWAYS merged by DT.
+    # DataTemplate-first: the Results view is ALWAYS merged by DT. Key columns
+    # hidden on screen are dropped from that section's key block.
     per_section_keys = {s["attr"]: key_cols_for(s) for s in sections}
-    per_section_keys["result_design"] = MERGE_DT_KEYS
-    KEY_W = max(len(v) for v in per_section_keys.values())
+    per_section_keys["result_design"] = list(MERGE_DT_KEYS)
+    per_section_keys = {
+        attr: [k for k in keys if k not in hidden_of.get(attr, set())]
+        for attr, keys in per_section_keys.items()
+    }
+    KEY_W = max(1, max(len(v) for v in per_section_keys.values()))
     FIRST_EXP = KEY_W + 1  # 1-based column of the first experiment
+
+    # Value columns exported = every experiment/special column visible in AT
+    # LEAST one section table. A column hidden in one specific table gets
+    # empty cells in that section only - the workbook keeps ONE aligned
+    # column layout down the page.
+    _all_tuples = col_tuples + special_tuples
+    EXPORT_TUPLES = [
+        t for t in _all_tuples if any(t[0] not in hidden_of[s["attr"]] for s in sections)
+    ]
 
     wb = Workbook()
     ws = wb.active
@@ -3051,30 +3309,46 @@ def build_xlsx() -> bytes:
 
     # --- frozen experiment header (ID over description) -----------------------
     HDR = 4
-    for j, (code, desc) in enumerate(col_tuples):
+    for j, (code, desc) in enumerate(EXPORT_TUPLES):
         c1 = ws.cell(row=HDR, column=FIRST_EXP + j, value=code)
         c1.font, c1.alignment, c1.fill, c1.border = bold, ctr, band_fill, box
-        c2 = ws.cell(row=HDR + 1, column=FIRST_EXP + j, value=desc)
-        c2.font, c2.alignment, c2.border = ital, ctr, box
+        if show_desc_row:  # description row mirrors the on-screen toggle
+            c2 = ws.cell(row=HDR + 1, column=FIRST_EXP + j, value=desc)
+            c2.font, c2.alignment, c2.border = ital, ctr, box
     ws.cell(row=HDR, column=1, value="Experiment →").font = bold
     ws.freeze_panes = ws.cell(row=HDR + 2, column=FIRST_EXP)
 
     r = HDR + 2
 
-    def write_section(label: str, keys: list[str], rows_iter, merge_cols: list[str]) -> None:
+    def write_section(
+        label: str,
+        keys: list[str],
+        rows_iter,
+        merge_cols: list[str],
+        extra_tuples: list[tuple[str, str]] | None = None,
+    ) -> None:
+        """One section table. `rows_iter` yields (keyvals, expvals) where
+        expvals is already aligned to EXPORT_TUPLES (+ extra_tuples appended,
+        e.g. Results' foreign-experiment columns)."""
         nonlocal r
+        extra_tuples = extra_tuples or []
+        n_vals = len(EXPORT_TUPLES) + len(extra_tuples)
         r += 1
         # full-width section banner
         ws.cell(row=r, column=1, value=label.upper()).font = bold_w
-        for cc in range(1, FIRST_EXP + len(col_tuples)):
+        for cc in range(1, FIRST_EXP + n_vals):
             ws.cell(row=r, column=cc).fill = sect_fill
         r += 1
         for i, k in enumerate(keys):
             c = ws.cell(row=r, column=1 + i, value=k)
             c.font, c.fill, c.border, c.alignment = bold, head_fill, box, lft
-        for j in range(len(col_tuples)):
+        for j in range(n_vals):
             c = ws.cell(row=r, column=FIRST_EXP + j)
             c.fill, c.border = head_fill, box
+        # extra columns exist only in this section - header them here
+        for j, (code, _desc) in enumerate(extra_tuples):
+            c = ws.cell(row=r, column=FIRST_EXP + len(EXPORT_TUPLES) + j, value=code)
+            c.font, c.alignment = bold, ctr
         r += 1
 
         first_data = r
@@ -3129,24 +3403,65 @@ def build_xlsx() -> bytes:
         keep = [i for i, rid in enumerate(rids) if sel.get(rid, True)]
         return df.iloc[keep]
 
+    def _exp_values(row, hidden: set[str]) -> list:
+        """One row's exported value cells: aligned to EXPORT_TUPLES, blanked
+        where this section's table hides the column, rounded like the screen."""
+        return [
+            "" if t[0] in hidden else _apply_decimals_text(row.get(t, ""), DECIMALS)
+            for t in EXPORT_TUPLES
+        ]
+
     for s in sections:
-        if s["attr"] != "result_design":
-            keys = per_section_keys[s["attr"]]
-            df, rids = rows_dataframe(s, with_ids=True)
-            df = _apply_row_selection(df, rids, f"sec::{s['attr']}")
+        attr = s["attr"]
+        hidden = hidden_of[attr]
+        merge_this = merge_flag_of[attr]
+        if attr != "result_design":
+            keys = per_section_keys[attr]
+            # same per-level Group/Subgroup row filters as the on-screen table
+            row_filter = {
+                lv: st.session_state.get(f"rowfilter::{attr}::{lv}") or []
+                for lv in range(len(hier_cols_for(s)))
+            }
+            df, rids = rows_dataframe(s, row_filter, with_ids=True)
+            df = _apply_row_selection(df, rids, f"sec::{attr}")
             write_section(
                 s["label"],
                 keys,
                 (
-                    ([row[k] for k in keys], [row[t] for t in col_tuples])
+                    ([row[k] for k in keys], _exp_values(row, hidden))
                     for _, row in df.iterrows()
                 ),
-                merge_cols=[k for k in keys if k != "Name"],  # hierarchy, not the leaf
+                # merged cells only when the table's 'Merge cells' is ticked
+                merge_cols=[k for k in keys if k != "Name"] if merge_this else [],
             )
         else:
-            # 'Merge Results by DT': one pooled table (no Property Task column);
-            # otherwise the per-task table with Property Task as the outermost key.
-            rdf = merged_results_by_dt_df()  # always merged by DT
+            # EXACTLY the frame shown on screen: same records (the DT panel's
+            # target tasks), same include_foreign choice, same fallback that
+            # keeps property rows visible when column filters hid every carrier.
+            rdf = results_drilldown_df(
+                loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
+            )
+            if rdf.empty and len(visible_cols) < len(exp_cols_all):
+                rdf = results_drilldown_df(
+                    loaded_recs,
+                    include_foreign=include_foreign,
+                    group_keys=MERGE_DT_KEYS,
+                    keep_all_rows=True,
+                )
+            extra_tuples: list[tuple[str, str]] = []
+            if not rdf.empty:
+                # the on-screen ticked/applied row selection
+                rrids = [
+                    "|".join(str(rdf.iloc[i][k]) for k in MERGE_DT_KEYS)
+                    for i in range(len(rdf))
+                ]
+                rdf = _apply_row_selection(rdf, rrids, "res::merged_by_dt")
+                # foreign-experiment columns (only present with include_foreign)
+                extra_tuples = [
+                    t
+                    for t in rdf.columns
+                    if isinstance(t, tuple) and t not in _all_tuples
+                ]
             keys = per_section_keys["result_design"]
             write_section(
                 s["label"],
@@ -3154,24 +3469,30 @@ def build_xlsx() -> bytes:
                 (
                     (
                         [row.get(k, "") for k in keys],
-                        [row.get(t, "") for t in col_tuples],
+                        _exp_values(row, hidden)
+                        + [
+                            _apply_decimals_text(row.get(t, ""), DECIMALS)
+                            for t in extra_tuples
+                        ],
                     )
                     for _, row in rdf.iterrows()
                 )
                 if not rdf.empty
                 else iter(()),
-                # Merge on all key columns. Property Task (when present) is the
-                # outermost, so its cells span all the rows of one task, Excel-style.
-                merge_cols=keys,
+                # Merge on all key columns - but only when the on-screen table
+                # has 'Merge cells' ticked.
+                merge_cols=keys if merge_this else [],
+                extra_tuples=extra_tuples,
             )
 
     # --- widths ---------------------------------------------------------------
     ws.column_dimensions["A"].width = 34
     for i in range(2, KEY_W + 1):
         ws.column_dimensions[get_column_letter(i)].width = 20
-    for j in range(len(col_tuples)):
+    for j in range(len(EXPORT_TUPLES)):
         ws.column_dimensions[get_column_letter(FIRST_EXP + j)].width = 16
-    ws.row_dimensions[HDR + 1].height = 42
+    if show_desc_row:
+        ws.row_dimensions[HDR + 1].height = 42
 
     # --- tidy long results on a second sheet (analysis-ready) -----------------
     ldf = all_results_long_df()
