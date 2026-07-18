@@ -58,8 +58,30 @@ v4 changes:
      Load Data / Reload / parallel requests, load plan) moved between
      'Selection of Data Templates in Results' and the Advanced filter.
 
+v5 changes:
+  1. Project search also queries the server (projects.search text=...) so
+     projects beyond the cached catalog / membership filters are found too.
+  2. The results download progress bar renders directly under Load Data.
+  3. Display menu rebuilt: the COMPLETE sheet-column catalog now comes from
+     the raw grid's Formulas[] array (Sheet.columns only lists first-row
+     cells, dropping Lookup/Function and empty Blank columns); the menu is a
+     compact popover listing column HEADERS (any type), defaulting to the
+     columns whose Display toggle is ON in Albert; chosen columns sit LEFT of
+     the experiments, right after the key columns.
+  4. Row-selection buttons regrouped into a 'Select visible rows' box
+     (All / None / Apply).
+  5.-7. Custom row/group reordering on every section table: an '↕ Reorder'
+     popover moves whole Group/Subgroup blocks (Results: Data Template / Data
+     Column; Process: Parameter group) among their siblings, and an editable
+     '#' column moves a single row inside its own block - a row can never
+     leave its hierarchy. Group/subgroup HEADER rows belong to their own block
+     (their name is shown in their level's cell) and travel with it. The same
+     ordering feeds the XLSX export.
+
 Requirements:
     pip install streamlit albert pandas truststore openpyxl
+    (Streamlit >= 1.32 recommended - st.popover; older versions fall back to
+    expanders.)
 
 Run:
     streamlit run app.py
@@ -341,6 +363,21 @@ def _proj_short(label: str, pid: str) -> str:
     return desc[:20] or pid
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def search_projects_live(_client: Albert, text: str) -> dict[str, str]:
+    """Server-side full-text project search for the search box. Complements the
+    cached catalog: finds projects beyond the catalog cap and projects that the
+    my_project/my_role union missed (e.g. a project shared with you through a
+    mechanism the membership filters don't cover). Cached 5 min per query."""
+    out: dict[str, str] = {}
+    try:
+        for p in _client.projects.search(text=text, max_items=200):
+            out[f"{p.description or '(no description)'}  [{p.id}]"] = p.id
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 pc1, pc2 = st.columns([3, 1])
 with pc2:
     only_mine = st.checkbox(
@@ -396,8 +433,15 @@ with pc1:
     _q = proj_query.strip().lower()
     if _q:
         _selected_now = set(st.session_state[_PROJ_KEY])
+        # ALSO search server-side: catches projects beyond the catalog cap and
+        # projects the membership filters missed (e.g. EXP13976 - editor role
+        # but not returned by myProject). The literal-substring test is still
+        # applied to everything that comes back.
+        _live = search_projects_live(client, proj_query.strip())
+        _label_to_id.update(_live)
+        _merged = list(dict.fromkeys(list(_proj_options) + list(_live)))
         _proj_options = [
-            l for l in _proj_options if _q in l.lower() or l in _selected_now
+            l for l in _merged if _q in l.lower() or l in _selected_now
         ]
     sel_proj_labels = st.multiselect(
         "Project",
@@ -627,28 +671,17 @@ def extract_sheet(_sheet, sheet_key: str) -> dict:
         if getattr(f, "id", None)
     }
 
-    # Worksheet "Display" column types (Albert's Display dropdown): Blank,
-    # Lookup, Function and Result columns. They carry NO inventory_id, so they
-    # are keyed by a per-sheet column key ('COL::<sheet>::<colId>') instead -
-    # unique across a multi-sheet comparison.
-    DISPLAY_TYPES = ("BLK", "LKP", "FNC", "RSL")
-
     columns = []
     for c in _sheet.columns:
         name = getattr(c, "name", None) or ""
         inv_id = getattr(c, "inventory_id", None)
-        cid = getattr(c, "column_id", None)
-        tcode = str(getattr(c, "type", "") or "").split(".")[-1]
-        col_key = inv_id or (
-            f"COL::{sheet_key}::{cid}" if cid and tcode in DISPLAY_TYPES else None
-        )
         columns.append(
             {
-                "column_id": cid,
+                "column_id": getattr(c, "column_id", None),
                 "name": name,
                 "type": str(getattr(c, "type", "") or ""),
                 "inventory_id": inv_id,
-                "col_key": col_key,
+                "col_key": inv_id,
                 "hidden": bool(getattr(c, "hidden", False)),
                 "locked": bool(getattr(c, "locked", False)),
                 "pinned": getattr(c, "pinned", None),
@@ -659,14 +692,79 @@ def extract_sheet(_sheet, sheet_key: str) -> dict:
             }
         )
 
-    # column_id -> COL key of the special (Display) columns. Sheet.columns IS
-    # product_design.columns, so the map only applies to the Product grid -
-    # column_ids of other designs are not comparable (see FIX below).
-    special_key_of = {
-        c["column_id"]: c["col_key"]
+    # ---- COMPLETE special-column catalog (Blank / Lookup / Function / ...) ----
+    # The SDK's Sheet.columns is built from the FIRST ROW's cells only, so it
+    # misses every Lookup/Function column and every Blank column with no value
+    # on that row. The authoritative column list is the raw grid response's
+    # Formulas[] array (one entry per column, with name + hidden - hidden is
+    # exactly Albert's Display-menu toggle state). One extra GET per sheet,
+    # cached with the rest of this extraction. Special columns are keyed
+    # 'COL::<sheet>::<colId>' (no inventory_id), unique across a comparison.
+    _pd_design = getattr(_sheet, "product_design", None)
+    special_catalog: list[dict] = []
+    if _pd_design is not None:
+        raw_grid = None
+        try:
+            resp = _pd_design.session.get(
+                f"/api/v3/worksheet/{_pd_design.id}/{_pd_design.design_type.value}/grid"
+            )
+            raw_grid = resp.json()
+        except Exception:  # noqa: BLE001
+            raw_grid = None
+        if isinstance(raw_grid, dict):
+            # cell type / header name per column, scanned across EVERY row
+            type_of: dict[str, str] = {}
+            name_of: dict[str, str] = {}
+            for item in raw_grid.get("Items") or []:
+                for v in item.get("Values") or []:
+                    cid = v.get("colId")
+                    if not cid:
+                        continue
+                    t = str(v.get("type") or "")
+                    if t and cid not in type_of:
+                        type_of[cid] = t
+                    nm = v.get("name")
+                    if nm and cid not in name_of:
+                        name_of[cid] = str(nm)
+            inv_col_ids = {c["column_id"] for c in columns if c["inventory_id"]}
+            for f in raw_grid.get("Formulas") or []:
+                cid = f.get("colId") if isinstance(f, dict) else None
+                if not cid or cid in inv_col_ids:
+                    continue
+                tcode = type_of.get(cid, "").split(".")[-1]
+                if tcode in ("INV", "Formula", "TAG"):
+                    continue  # formulation / tag columns are handled above
+                nm = str(f.get("name") or name_of.get(cid) or "")
+                if nm.strip().lower() == "name":
+                    continue  # the built-in label column
+                special_catalog.append(
+                    {
+                        "column_id": cid,
+                        "name": nm or cid,
+                        "type": tcode or "BLK",
+                        "inventory_id": None,
+                        "col_key": f"COL::{sheet_key}::{cid}",
+                        # Formulas[].hidden IS the Display-menu toggle in Albert
+                        "hidden": bool(f.get("hidden") or False),
+                        "locked": False,
+                        "pinned": None,
+                        "formulation_name": "",
+                        "is_label_col": False,
+                    }
+                )
+    # drop Sheet.columns duplicates of the special columns, then append the
+    # complete catalog (the catalog entry carries the authoritative hidden flag)
+    _special_cids = {c["column_id"] for c in special_catalog}
+    columns = [
+        c
         for c in columns
-        if c["col_key"] and not c["inventory_id"] and c["column_id"]
-    }
+        if c["inventory_id"] or c["is_label_col"] or c["column_id"] not in _special_cids
+    ]
+    columns.extend(special_catalog)
+
+    # column_id -> COL key, for capturing the special columns' cell values
+    # (valid on the PRODUCT grid only - other designs' column_ids differ).
+    special_key_of = {c["column_id"]: c["col_key"] for c in special_catalog}
 
     sections = []
     for attr, label in SECTION_ORDER:
@@ -1483,6 +1581,98 @@ def _safe_multiselect(label: str, options: list[str], key: str, default=None, **
     return st.multiselect(label, options, key=key, **kw)
 
 
+def _popover(label: str, **kw):
+    """st.popover (compact dropdown panel) with an expander fallback for older
+    Streamlit versions."""
+    if hasattr(st, "popover"):
+        return st.popover(label, **kw)
+    return st.expander(label)
+
+
+def _bordered():
+    """Bordered container (fallback to a plain one on older Streamlit)."""
+    try:
+        return st.container(border=True)
+    except TypeError:  # Streamlit < 1.29
+        return st.container()
+
+
+# ===========================================================================
+# CUSTOM ROW / GROUP ORDERING - shared by every section table + the XLSX.
+#
+# Two per-table stores in session state:
+#   gorder::{table_key}  '¦'.join(node path) -> ordinal among its SIBLINGS
+#   rorder::{table_key}  row_id              -> ordinal within its LEAF BLOCK
+#
+# A row's sort key is the ordinal of each of its ancestor nodes (compared only
+# against true siblings - deeper components are reached only when every parent
+# ordinal ties, i.e. within the same parent) followed by its own ordinal. So a
+# row can NEVER leave its group/subgroup: reordering only permutes blocks among
+# siblings and rows inside their own block.
+# ===========================================================================
+def _apply_custom_order(items: list[tuple[tuple, str, Any]], table_key: str) -> list:
+    """items = [(path tuple, row_id, payload)] in original order. Returns the
+    payloads re-sorted by the user's custom group/row ordering (stable: with no
+    stored ordering the original order is preserved).
+
+    Every 'unit' - a group/subgroup node OR a loose row sitting directly at
+    that level - defaults to its FIRST-APPEARANCE item index, so node and row
+    ordinals share one scale and reordering one never scrambles the other.
+    Reorders always PERMUTE existing ordinal values (see the swap/move
+    helpers), keeping that shared scale intact. The effective ordinals are
+    published in session state ('ordmeta::' / 'ordmeta_rows::') for the
+    reorder UI to read."""
+    gorder = st.session_state.get(f"gorder::{table_key}") or {}
+    rorder = st.session_state.get(f"rorder::{table_key}") or {}
+    seen: dict[tuple, float] = {}
+    for i, (path, _rid, _p) in enumerate(items):
+        for k in range(1, len(path) + 1):
+            seen.setdefault(path[:k], float(i))
+    node_ord = {n: float(gorder.get("¦".join(n), d)) for n, d in seen.items()}
+    row_ord = {
+        rid: float(rorder.get(rid, i)) for i, (_path, rid, _p) in enumerate(items)
+    }
+    st.session_state[f"ordmeta::{table_key}"] = node_ord
+    st.session_state[f"ordmeta_rows::{table_key}"] = row_ord
+
+    def sort_key(pair):
+        i, (path, rid, _p) = pair
+        key = [node_ord[path[:k]] for k in range(1, len(path) + 1)]
+        key.append(row_ord[rid])
+        key.append(float(i))  # stability
+        return key
+
+    return [p for _, (_, _, p) in sorted(enumerate(items), key=sort_key)]
+
+
+def _swap_group_order(table_key: str, node_a: tuple, node_b: tuple) -> None:
+    """Swap two sibling nodes by EXCHANGING their effective ordinal values
+    (value permutation keeps the shared node/row ordinal scale intact)."""
+    meta = st.session_state.get(f"ordmeta::{table_key}") or {}
+    va, vb = meta.get(node_a), meta.get(node_b)
+    if va is None or vb is None:
+        return
+    g = st.session_state.setdefault(f"gorder::{table_key}", {})
+    g["¦".join(node_a)], g["¦".join(node_b)] = float(vb), float(va)
+
+
+def _section_order_items(section) -> list[tuple[tuple, str, dict]]:
+    """(effective path, row_id, row) per section row. The EFFECTIVE path of a
+    group/subgroup HEADER row includes its own name, so the header belongs to
+    its own block and moves with it (e.g. the 'Neutralization degree (ND)' BLK
+    row travels with the 'Neutralization degree (ND)' subgroup)."""
+    rows = section["rows"]
+    ancestors = {aid for r in rows for aid in (r.get("path_ids") or [])}
+    items = []
+    for r in rows:
+        raw = str(r["row_id"]).split("::")[-1]  # merged ids are 'PID::ROWn'
+        eff = tuple(r["path"]) + (
+            (r["name"],) if raw in ancestors and r["name"] else ()
+        )
+        items.append((eff, str(r["row_id"]), r))
+    return items
+
+
 # ===========================================================================
 # 4c) SELECTION OF DATA TEMPLATES IN RESULTS - DataTemplate-first flow.
 #     Replaces the old "Data Templates (Results only)" filter. Each selector
@@ -1683,6 +1873,7 @@ _load_clicked = False
 target_tasks: dict[str, dict] = {}
 _results_to_fetch: list[dict] = []
 loaded_recs: list[dict] = []
+RESULTS_PROGRESS_SLOT = None  # placeholder rendered under the Load Data button
 results_store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
 
 if section_by_attr.get("result_design"):
@@ -1750,6 +1941,10 @@ if section_by_attr.get("result_design"):
             "block x inventory combo of the SELECTED Data Templates, across all "
             "target tasks at once. Raising this shortens the load; back off on errors.",
         )
+
+    # The download progress bar renders HERE, just below the Load Data button
+    # (the fetch itself still runs from the Results section, into this slot).
+    RESULTS_PROGRESS_SLOT = st.container()
 
     if _reload_clicked:
         st.session_state["dt_cache_bust"] = int(st.session_state.get("dt_cache_bust", 0)) + 1
@@ -2149,57 +2344,67 @@ with o4:
     )
 
 # --- 'Display' menu: reproduces the worksheet's Display dropdown -------------
-# Albert's worksheet has a 'Display' button that shows/hides the Blank, Lookup,
-# Function and Result COLUMNS. Those columns carry no inventory_id (they are
-# not formulations), so they were previously dropped entirely; they are now
-# captured from the Product Design grid and toggled here per type.
+# Compact popover (like Albert's Display button) that lists the HEADER NAME of
+# every non-experiment sheet column (Blank / Lookup / Function / Result, ...)
+# from the complete Formulas[] catalog - the type does not matter for the
+# menu. Default selection = the columns whose Display toggle is ON in Albert
+# (hidden == False). Selected columns are placed LEFT of the experiment
+# columns, right after the key (Group / Subgroup / Name) columns.
 DISPLAY_COL_LABELS = {
-    "BLK": "Blank columns",
-    "LKP": "Lookup columns",
-    "FNC": "Function columns",
-    "RSL": "Result columns",
+    "BLK": "Blank column",
+    "LKP": "Lookup column",
+    "FNC": "Function column",
+    "RSL": "Result column",
+    "FOR": "Formula column",
 }
 special_cols_all = [
-    c
-    for c in columns
-    if (c.get("col_key") or "").startswith("COL::")
-    and str(c["type"]).split(".")[-1] in DISPLAY_COL_LABELS
-    and (show_hidden or not c["hidden"])
+    c for c in columns if (c.get("col_key") or "").startswith("COL::")
 ]
-_display_present = [
-    lab
-    for code, lab in DISPLAY_COL_LABELS.items()
-    if any(str(c["type"]).split(".")[-1] == code for c in special_cols_all)
-]
-if _display_present:
-    display_sel = _safe_multiselect(
-        "Display",
-        _display_present,
-        key="display_cols",
-        default=_display_present,
-        help="Reproduces the worksheet's **Display** menu: choose which of the "
-        "sheet's Blank / Lookup / Function / Result columns are shown in the "
-        "tables (and in the XLSX download). They appear after the experiment "
-        "columns, labelled with their column type.",
-    )
-else:
-    display_sel = []
-    st.caption("Display: this sheet has no Blank / Lookup / Function / Result columns.")
+# unique display name per column (two columns may share a header)
+_sp_seen: dict[str, int] = {}
+for _c in special_cols_all:
+    _nm = _c["name"] or _c["column_id"] or "column"
+    if _nm in _sp_seen:
+        _sp_seen[_nm] += 1
+        _c["_disp_name"] = f"{_nm} ({_sp_seen[_nm]})"
+    else:
+        _sp_seen[_nm] = 1
+        _c["_disp_name"] = _nm
+
+_disp_col, _ = st.columns([1.2, 2.8])  # keep the menu small, not full-width
+with _disp_col:
+    if special_cols_all:
+        with _popover("🗂️ Display"):
+            st.caption(
+                "Sheet columns (Blank / Lookup / Function / ...). Pick the ones "
+                "to show - they appear right after the last Subgroup column, "
+                "before the experiments. Default = the columns visible in "
+                "Albert's own Display menu."
+            )
+            display_sel = _safe_multiselect(
+                "Columns",
+                [c["_disp_name"] for c in special_cols_all],
+                key="display_cols",
+                default=[c["_disp_name"] for c in special_cols_all if not c["hidden"]],
+                help="The list shows every sheet column found on the worksheet "
+                "grid, whatever its type.",
+            )
+    else:
+        display_sel = []
+        st.caption("Display: no Blank / Lookup / Function columns on this sheet.")
 visible_special_cols = [
-    c
-    for c in special_cols_all
-    if DISPLAY_COL_LABELS[str(c["type"]).split(".")[-1]] in display_sel
+    c for c in special_cols_all if c.get("_disp_name") in (display_sel or [])
 ]
 
 special_tuples: list[tuple[str, str]] = []
 for _c in visible_special_cols:
-    _code = _c["name"] or _c["column_id"] or "column"
+    _code = _c["_disp_name"]
     if _code in _seen_codes:  # shares the uniqueness pool with the experiment codes
         _seen_codes[_code] += 1
         _code = f"{_code} ({_seen_codes[_code]})"
     else:
         _seen_codes[_code] = 1
-    _lab = DISPLAY_COL_LABELS[str(_c["type"]).split(".")[-1]].rstrip("s")
+    _lab = DISPLAY_COL_LABELS.get(str(_c["type"]).split(".")[-1], "Sheet column")
     _origin = _c.get("origin") or ""
     special_tuples.append((_code, _lab + (f"  ·  {_origin}" if _origin else "")))
 
@@ -2244,11 +2449,19 @@ def rows_dataframe(
     section: dict,
     row_filter: dict | None = None,
     with_ids: bool = False,
+    table_key: str | None = None,
 ):
+    """Section rows -> display frame. With `table_key` the user's custom
+    group/row ordering is applied (same ordering feeds the XLSX). When
+    `with_ids` is set, returns (df, row_ids, effective_paths) - the paths
+    drive the reorder controls."""
     hcols = hier_cols_for(section)
     kcols = key_cols_for(section)
-    recs, rids = [], []
-    for r in section["rows"]:
+    items = _section_order_items(section)
+    ordered = _apply_custom_order(items, table_key) if table_key else [p for _, _, p in items]
+    eff_of = {rid: path for path, rid, _ in items}
+    recs, rids, paths = [], [], []
+    for r in ordered:
         if hide_blk and r["type_raw"].split(".")[-1] == "BLK":
             continue
         if row_filter and not _row_in_filter(r, row_filter):
@@ -2257,22 +2470,31 @@ def rows_dataframe(
         if focus_view and not any(v != "" for v in vals.values()):
             continue
 
+        eff = eff_of.get(str(r["row_id"]), tuple(r["path"]))
+        is_header = len(eff) == len(r["path"]) + 1  # a group/subgroup header row
         name = r["name"]
         if indent_names and r["path"]:
             name = ("\u00a0" * 4 * len(r["path"])) + name
         rec = {"Name": name}
         for i, hc in enumerate(hcols):
-            rec[hc] = r["path"][i] if len(r["path"]) > i else ""
+            v = r["path"][i] if len(r["path"]) > i else ""
+            # a header row belongs to ITS OWN group/subgroup: show its name in
+            # its level's cell so it merges (and moves) with its block
+            if not v and is_header and i == len(r["path"]):
+                v = r["name"]
+            rec[hc] = v
         if show_type_col:
             rec["Row type"] = r["type"]
-        for c, t in zip(visible_cols, col_tuples):
-            rec[t] = vals[c["inventory_id"]]
         for c, t in zip(visible_special_cols, special_tuples):
             rec[t] = r["values"].get(c["col_key"], "")
+        for c, t in zip(visible_cols, col_tuples):
+            rec[t] = vals[c["inventory_id"]]
         recs.append(rec)
         rids.append(str(r["row_id"]))
-    df = pd.DataFrame(recs).reindex(columns=kcols + col_tuples + special_tuples).fillna("")
-    return (df, rids) if with_ids else df
+        paths.append(eff)
+    # special (Display) columns sit BETWEEN the key block and the experiments
+    df = pd.DataFrame(recs).reindex(columns=kcols + special_tuples + col_tuples).fillna("")
+    return (df, rids, paths) if with_ids else df
 
 
 def _merge_parents(names: list[str]) -> list[list[int]]:
@@ -2412,6 +2634,7 @@ def show_df(
     table_key: str,
     row_ids: list[str] | None = None,
     merge_cols: list[str] | None = None,
+    order_paths: list[tuple] | None = None,
 ):
     """Render a section table with per-table controls.
 
@@ -2419,6 +2642,11 @@ def show_df(
     pandas MultiIndex, which Streamlit stringifies for long names, leaking the raw
     tuple repr into cells. The description rides along as a header tooltip and an
     optional first row.
+
+    `order_paths` (one hierarchy path per row, aligned with `row_ids`) enables
+    the reorder controls: an '↕ Reorder' popover to move whole group/subgroup
+    blocks among their siblings, and an editable '#' column to move a single
+    row INSIDE its own block (it can never leave the block).
     """
     if df.empty:
         st.info("No rows to display.")
@@ -2447,27 +2675,75 @@ def show_df(
         for _k in [k for k in st.session_state if str(k).startswith(f"ed::{table_key}")]:
             del st.session_state[_k]
 
-    b1, b2, b3, _gap, c_fz, c_mg, c_hide, c_full = st.columns(
-        [1, 1, 1, 0.4, 1.3, 1.0, 2.0, 0.9]
+    b_sel, c_ro, c_fz, c_mg, c_hide, c_full = st.columns(
+        [2.0, 0.9, 1.2, 1.0, 1.9, 0.8]
     )
-    with b1:
-        if st.button("Select all", key=f"sa::{table_key}"):
-            for rid in row_ids:
-                sel[rid] = True
-            st.session_state[applied_key] = False  # bring every row back into view
-            _clear_editor_state()
-            st.rerun()
-    with b2:
-        if st.button("Unselect all", key=f"ua::{table_key}"):
-            for rid in row_ids:
-                sel[rid] = False
-            _clear_editor_state()
-            st.rerun()
-    with b3:
-        if st.button("Apply selection", key=f"ap::{table_key}", type="primary"):
-            st.session_state[applied_key] = True
-            _clear_editor_state()
-            st.rerun()
+    with b_sel, _bordered():
+        st.caption("Select visible rows")
+        bb1, bb2, bb3 = st.columns(3)
+        with bb1:
+            if st.button("All", key=f"sa::{table_key}", use_container_width=True):
+                for rid in row_ids:
+                    sel[rid] = True
+                st.session_state[applied_key] = False  # bring every row back into view
+                _clear_editor_state()
+                st.rerun()
+        with bb2:
+            if st.button("None", key=f"ua::{table_key}", use_container_width=True):
+                for rid in row_ids:
+                    sel[rid] = False
+                _clear_editor_state()
+                st.rerun()
+        with bb3:
+            if st.button(
+                "Apply", key=f"ap::{table_key}", type="primary", use_container_width=True
+            ):
+                st.session_state[applied_key] = True
+                _clear_editor_state()
+                st.rerun()
+    with c_ro:
+        if order_paths is not None:
+            with _popover("↕ Reorder"):
+                st.caption(
+                    "Move a whole group/block up or down among its own siblings - "
+                    "every row of the block travels with it, and a block can never "
+                    "leave its parent. To move a SINGLE row inside its block, edit "
+                    "the **#** column directly in the table."
+                )
+                _nodes: list[tuple] = []
+                _seen_nodes: set[tuple] = set()
+                for _p in order_paths:
+                    for _k in range(1, len(_p) + 1):
+                        _n = _p[:_k]
+                        if _n not in _seen_nodes:
+                            _seen_nodes.add(_n)
+                            _nodes.append(_n)
+                if not _nodes:
+                    st.caption("This table has no groups/blocks to reorder.")
+                _sibs: dict[tuple, list[tuple]] = {}
+                for _n in _nodes:
+                    _sibs.setdefault(_n[:-1], []).append(_n)
+                for _n in _nodes:
+                    _sl = _sibs[_n[:-1]]
+                    _i = _sl.index(_n)
+                    _cc = st.columns([6, 1, 1])
+                    _cc[0].markdown(
+                        ("&nbsp;" * 6 * (len(_n) - 1)) + f"**{_n[-1]}**",
+                        unsafe_allow_html=True,
+                    )
+                    _kb = hashlib.md5("¦".join(_n).encode()).hexdigest()[:10]
+                    with _cc[1]:
+                        if st.button("⬆", key=f"gu::{table_key}::{_kb}", disabled=_i == 0):
+                            _swap_group_order(table_key, _n, _sl[_i - 1])
+                            _clear_editor_state()
+                            st.rerun()
+                    with _cc[2]:
+                        if st.button(
+                            "⬇", key=f"gd::{table_key}::{_kb}", disabled=_i == len(_sl) - 1
+                        ):
+                            _swap_group_order(table_key, _n, _sl[_i + 1])
+                            _clear_editor_state()
+                            st.rerun()
     with c_fz:
         freeze = st.number_input(
             "Freeze columns",
@@ -2520,8 +2796,26 @@ def show_df(
     if applied:
         disp = disp[disp["✓"]]
         if disp.empty:
-            st.warning("No rows selected. Press **Select all** to bring them all back.")
+            st.warning("No rows selected. Press **All** to bring them all back.")
             return
+
+    # ---- '#' column: the row's position INSIDE its own block ------------------
+    # Editable; typing a new number moves the row within its block only (the
+    # editor callback permutes the block's ordinal values, so a row can never
+    # land in another group/subgroup).
+    if order_paths is not None:
+        _path_of = dict(zip(row_ids, order_paths))
+        _blocks: dict[tuple, list[str]] = {}
+        for _rid in disp["__rid__"]:
+            _blocks.setdefault(tuple(_path_of.get(_rid, ())), []).append(_rid)
+        _pos_of = {
+            _rid: _j + 1 for _blk in _blocks.values() for _j, _rid in enumerate(_blk)
+        }
+        disp.insert(1, "#", [float(_pos_of.get(_rid, 1)) for _rid in disp["__rid__"]])
+        st.session_state[f"edblocks::{table_key}"] = {
+            "blocks": {"¦".join(k): v for k, v in _blocks.items()},
+            "of": {rid: "¦".join(k) for k, v in _blocks.items() for rid in v},
+        }
 
     if show_desc_row and col_tuples:
         head = {c: "" for c in disp.columns}
@@ -2532,6 +2826,8 @@ def show_df(
             if code in disp.columns:
                 head[code] = desc
         disp = pd.concat([pd.DataFrame([head]), disp], ignore_index=True)
+        if "#" in disp.columns:
+            disp["#"] = pd.to_numeric(disp["#"], errors="coerce")
 
     # ---- decimals: round the experiment (value) columns for display ----------
     if DECIMALS is not None:
@@ -2541,7 +2837,7 @@ def show_df(
 
     # ---- MERGED (read-only, real spanning cells) ------------------------------
     if merge:
-        body = disp.drop(columns=["✓", "__rid__"])
+        body = disp.drop(columns=[c for c in ("✓", "#", "__rid__") if c in disp.columns])
         shown = [c for c in body.columns if c not in hidden_set]
         body = body[shown]
         # Column widths are adjustable in the merged view.
@@ -2587,11 +2883,21 @@ def show_df(
     ordered = [c for c in disp.columns if c != "__rid__" and c not in hidden_set]
     cfg: dict[str, Any] = {
         "✓": st.column_config.CheckboxColumn(
-            "", help="Tick the rows to keep, then press Apply selection.", pinned=True
+            "", help="Tick the rows to keep, then press Apply.", pinned=True
         ),
         "__rid__": None,  # hidden
     }
-    for i, c in enumerate([x for x in ordered if x != "✓"], start=1):
+    if "#" in disp.columns:
+        cfg["#"] = st.column_config.NumberColumn(
+            "#",
+            help="Position of the row INSIDE its own group/subgroup block. Type "
+            "a new number to move the row within its block - it can never leave "
+            "its block. Whole blocks are moved with the ↕ Reorder menu.",
+            min_value=1,
+            step=1,
+            pinned=True,
+        )
+    for i, c in enumerate([x for x in ordered if x not in ("✓", "#")], start=1):
         desc = next((d for code, d in col_tuples + special_tuples if code == c), None)
         cfg[c] = st.column_config.Column(label=c, help=desc or None, pinned=i <= freeze)
 
@@ -2617,19 +2923,43 @@ def show_df(
     ]:
         del st.session_state[_k]
 
-    def _sync_ticks(_ed_key=ed_key, _sel_key=sel_key, _ord_key=ord_key) -> None:
+    def _sync_editor(_ed_key=ed_key, _sel_key=sel_key, _ord_key=ord_key, _tk=table_key) -> None:
+        """Runs BEFORE the rerun: persists checkbox ticks and applies '#' row
+        moves (permuting the ordinal VALUES of the row's own block only)."""
         state = st.session_state.get(_ed_key)
         order = st.session_state.get(_ord_key) or []
         if not isinstance(state, dict):
             return
         sel_map = st.session_state.setdefault(_sel_key, {})
+        binfo = st.session_state.get(f"edblocks::{_tk}") or {}
+        row_meta = st.session_state.get(f"ordmeta_rows::{_tk}") or {}
+        rorder = st.session_state.setdefault(f"rorder::{_tk}", {})
         for pos, delta in (state.get("edited_rows") or {}).items():
             try:
                 p = int(pos)
             except (TypeError, ValueError):
                 continue
-            if "✓" in delta and 0 <= p < len(order) and order[p] != "__desc__":
-                sel_map[order[p]] = bool(delta["✓"])
+            if not (0 <= p < len(order)) or order[p] == "__desc__":
+                continue
+            rid = order[p]
+            if "✓" in delta:
+                sel_map[rid] = bool(delta["✓"])
+            if "#" in delta and delta["#"] is not None:
+                blk = (binfo.get("of") or {}).get(rid)
+                rows_b = list((binfo.get("blocks") or {}).get(blk) or [])
+                if rid not in rows_b:
+                    continue
+                try:
+                    tgt = int(float(delta["#"]))
+                except (TypeError, ValueError):
+                    continue
+                tgt = max(1, min(tgt, len(rows_b)))
+                # current effective ordinals of the block, in display order
+                vals = [float(rorder.get(r, row_meta.get(r, i))) for i, r in enumerate(rows_b)]
+                rows_b.remove(rid)
+                rows_b.insert(tgt - 1, rid)
+                for v, r in zip(sorted(vals), rows_b):
+                    rorder[r] = v
 
     # Only pass an explicit height for the full-screen view; omitting it lets the
     # grid auto-size (passing height=None raises on some Streamlit versions).
@@ -2640,9 +2970,9 @@ def show_df(
         hide_index=True,
         column_config=cfg,
         column_order=ordered,
-        disabled=[c for c in ordered if c != "✓"],
+        disabled=[c for c in ordered if c not in ("✓", "#")],
         key=ed_key,
-        on_change=_sync_ticks,
+        on_change=_sync_editor,
         **editor_kwargs,
     )
 
@@ -2833,7 +3163,10 @@ def load_target_results(_client: Albert, store: dict, tasks_to_fetch: list[dict]
             wanted_blocks.setdefault(_o["task_id"], set()).add(_o["block_id"])
 
     # --- STEP 1: check_for_task_data per task (parallel) -> combo plan ---------
-    prog = st.progress(0.0, text="Planning block/inventory combos...")
+    # The bar renders in RESULTS_PROGRESS_SLOT - directly under the Load Data
+    # button in section 2 - falling back to in-place rendering without it.
+    _prog_host = RESULTS_PROGRESS_SLOT if RESULTS_PROGRESS_SLOT is not None else st
+    prog = _prog_host.progress(0.0, text="Planning block/inventory combos...")
 
     def _check(task: dict):
         try:
@@ -3021,6 +3354,7 @@ def results_drilldown_df(
     include_foreign: bool = False,
     group_keys: list[str] | None = None,
     keep_all_rows: bool = False,
+    order_table_key: str | None = None,
 ) -> pd.DataFrame:
     """Pivot: DT | DC | Unit | I1 | I2 | Trial rows x visible experiment cols.
     `include_foreign` also shows inventory items filtered out or belonging to
@@ -3063,14 +3397,28 @@ def results_drilldown_df(
             recs.append(rec)
     if not recs:
         return pd.DataFrame()
-    # Keep rows of the same Data Template together (the source order can interleave
-    # them, e.g. a Coating Weight row between two Cobb Value rows), so the merged
-    # Data Template cell spans them. First-appearance order and the order within a
-    # template are both preserved (Python's sort is stable).
-    dt_order: dict[str, int] = {}
-    for rec in recs:
-        dt_order.setdefault(str(rec.get("Data Template", "")), len(dt_order))
-    recs.sort(key=lambda rec: dt_order[str(rec.get("Data Template", ""))])
+    if order_table_key:
+        # DataTemplate/DataColumn block ordering (same mechanism as the section
+        # tables): rows are grouped DT -> Data Column and the user's custom
+        # block/row order is applied on top. A row can never leave its DT/DC.
+        items = [
+            (
+                (str(rec.get("Data Template", "")), str(rec.get("Data Column", ""))),
+                "|".join(str(rec.get(k, "")) for k in keys),
+                rec,
+            )
+            for rec in recs
+        ]
+        recs = _apply_custom_order(items, order_table_key)
+    else:
+        # Keep rows of the same Data Template together (the source order can
+        # interleave them, e.g. a Coating Weight row between two Cobb Value
+        # rows), so the merged Data Template cell spans them. First-appearance
+        # order and the order within a template are both preserved (stable sort).
+        dt_order: dict[str, int] = {}
+        for rec in recs:
+            dt_order.setdefault(str(rec.get("Data Template", "")), len(dt_order))
+        recs.sort(key=lambda rec: dt_order[str(rec.get("Data Template", ""))])
     return pd.DataFrame(recs).reindex(columns=keys + col_tuples + extra_cols).fillna("")
 
 
@@ -3120,8 +3468,16 @@ for s in sections:
                         help=f"'{NONE_LABEL}' = rows with no {hc.lower()}.",
                     )
 
-        sdf, srids = rows_dataframe(s, row_filter, with_ids=True)
-        show_df(sdf, key_cols_for(s), table_key=f"sec::{s['attr']}", row_ids=srids)
+        sdf, srids, spaths = rows_dataframe(
+            s, row_filter, with_ids=True, table_key=f"sec::{s['attr']}"
+        )
+        show_df(
+            sdf,
+            key_cols_for(s),
+            table_key=f"sec::{s['attr']}",
+            row_ids=srids,
+            order_paths=spaths,
+        )
         continue
 
     # ----- Results: DataTemplate-first. What gets downloaded is defined by the
@@ -3166,13 +3522,15 @@ for s in sections:
             st.dataframe(ldf, use_container_width=True, hide_index=True)
     else:
         mdf = results_drilldown_df(
-            loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
+            loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS,
+            order_table_key="res::merged_by_dt",
         )
         if mdf.empty and len(visible_cols) < len(exp_cols_all):
             # keep the table visible when column filters hid every carrier
             mdf = results_drilldown_df(
                 loaded_recs, include_foreign=include_foreign,
                 group_keys=MERGE_DT_KEYS, keep_all_rows=True,
+                order_table_key="res::merged_by_dt",
             )
         if mdf.empty:
             if loaded_recs:
@@ -3185,7 +3543,19 @@ for s in sections:
             rids = [
                 "|".join(str(mdf.iloc[i][k]) for k in MERGE_DT_KEYS) for i in range(len(mdf))
             ]
-            show_df(mdf, MERGE_DT_KEYS, table_key="res::merged_by_dt", row_ids=rids)
+            # reorder blocks = Data Template › Data Column (rows can never
+            # leave their DT / Data Column)
+            rpaths = [
+                (str(mdf.iloc[i]["Data Template"]), str(mdf.iloc[i]["Data Column"]))
+                for i in range(len(mdf))
+            ]
+            show_df(
+                mdf,
+                MERGE_DT_KEYS,
+                table_key="res::merged_by_dt",
+                row_ids=rids,
+                order_paths=rpaths,
+            )
     # (the DT index & Load plan diagnostics expander moved to section 2, next
     #  to the load controls)
 
@@ -3269,11 +3639,11 @@ def build_xlsx() -> bytes:
     KEY_W = max(1, max(len(v) for v in per_section_keys.values()))
     FIRST_EXP = KEY_W + 1  # 1-based column of the first experiment
 
-    # Value columns exported = every experiment/special column visible in AT
-    # LEAST one section table. A column hidden in one specific table gets
-    # empty cells in that section only - the workbook keeps ONE aligned
-    # column layout down the page.
-    _all_tuples = col_tuples + special_tuples
+    # Value columns exported = every special/experiment column visible in AT
+    # LEAST one section table (special Display columns first, mirroring the
+    # on-screen order). A column hidden in one specific table gets empty cells
+    # in that section only - the workbook keeps ONE aligned column layout.
+    _all_tuples = special_tuples + col_tuples
     EXPORT_TUPLES = [
         t for t in _all_tuples if any(t[0] not in hidden_of[s["attr"]] for s in sections)
     ]
@@ -3422,7 +3792,9 @@ def build_xlsx() -> bytes:
                 lv: st.session_state.get(f"rowfilter::{attr}::{lv}") or []
                 for lv in range(len(hier_cols_for(s)))
             }
-            df, rids = rows_dataframe(s, row_filter, with_ids=True)
+            df, rids, _spaths = rows_dataframe(
+                s, row_filter, with_ids=True, table_key=f"sec::{attr}"
+            )
             df = _apply_row_selection(df, rids, f"sec::{attr}")
             write_section(
                 s["label"],
@@ -3439,7 +3811,8 @@ def build_xlsx() -> bytes:
             # target tasks), same include_foreign choice, same fallback that
             # keeps property rows visible when column filters hid every carrier.
             rdf = results_drilldown_df(
-                loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS
+                loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS,
+                order_table_key="res::merged_by_dt",
             )
             if rdf.empty and len(visible_cols) < len(exp_cols_all):
                 rdf = results_drilldown_df(
@@ -3447,6 +3820,7 @@ def build_xlsx() -> bytes:
                     include_foreign=include_foreign,
                     group_keys=MERGE_DT_KEYS,
                     keep_all_rows=True,
+                    order_table_key="res::merged_by_dt",
                 )
             extra_tuples: list[tuple[str, str]] = []
             if not rdf.empty:
