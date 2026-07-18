@@ -1815,27 +1815,29 @@ if _autosel_clicked:
     else:
         st.info("No Data Template in the selected project(s) contains property data.")
 
-# --- per-row 'Remove DT' (deferred): each selector row renders a Remove
-# button under its Data Template; the click stores the row index and reruns,
-# and the removal is executed HERE - before any dtsel widget of this run is
-# instantiated, because Streamlit forbids rewriting an instantiated widget's
-# session-state key. Rows above the removed one shift down one slot so the
-# remaining selections survive untouched.
-_dtsel_rm = st.session_state.pop("dtsel_remove_pending", None)
-if _dtsel_rm is not None:
-    _cnt = int(st.session_state.get("dtsel_count", 0))
-    if 0 <= _dtsel_rm < _cnt:
-        for _k in [k for k in st.session_state if str(k).startswith(f"dtsel::{_dtsel_rm}::")]:
-            del st.session_state[_k]
-        for _j in range(_dtsel_rm + 1, _cnt):
-            _pre = f"dtsel::{_j}::"
-            for _k in [k for k in st.session_state if str(k).startswith(_pre)]:
-                _sfx = str(_k)[len(_pre):]
-                _v = st.session_state.pop(_k)
-                # button state (::rm) cannot be assigned via session state
-                if _sfx != "rm":
-                    st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = _v
-        st.session_state["dtsel_count"] = _cnt - 1
+# --- per-row 'Remove DT': each selector row renders a Remove button under its
+# Data Template. The removal runs as the button's on_click CALLBACK - callbacks
+# execute BEFORE the script (and thus before any dtsel widget) runs, the only
+# safe moment to rewrite widget-keyed session state. A mid-run st.rerun()
+# would NOT work here: interrupting the script before the later rows render
+# makes Streamlit clean up their widget state, so the shifted values are lost
+# and it always looks like the LAST row was removed (verified with AppTest).
+# Rows below the removed one shift down one slot, keeping their selections.
+def _dtsel_remove_row(i: int) -> None:
+    cnt = int(st.session_state.get("dtsel_count", 0))
+    if not (0 <= i < cnt):
+        return
+    for _k in [k for k in st.session_state if str(k).startswith(f"dtsel::{i}::")]:
+        del st.session_state[_k]
+    for _j in range(i + 1, cnt):
+        _pre = f"dtsel::{_j}::"
+        for _k in [k for k in st.session_state if str(k).startswith(_pre)]:
+            _sfx = str(_k)[len(_pre):]
+            _v = st.session_state.pop(_k)
+            # button state (::rm) cannot be assigned via session state
+            if _sfx != "rm":
+                st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = _v
+    st.session_state["dtsel_count"] = cnt - 1
 
 # --- deferred prune: runs on the first render where EVERY task behind the
 # selected templates is in the results store (i.e. right after the
@@ -1928,11 +1930,15 @@ for _i in range(_dtsel_count):
         )
         # one Remove button per row, right under its Data Template - so after
         # 'Select all Data Templates with values' the uninteresting hits can be
-        # discarded one by one (the actual removal is deferred to the handler
-        # above the widget loop; see dtsel_remove_pending).
-        if st.button("🗑️ Remove DT", key=f"dtsel::{_i}::rm", help="Remove this Data Template row."):
-            st.session_state["dtsel_remove_pending"] = _i
-            st.rerun()
+        # discarded one by one (the removal runs in the on_click callback
+        # defined above the widget loop, before any widget instantiates).
+        st.button(
+            "🗑️ Remove DT",
+            key=f"dtsel::{_i}::rm",
+            help="Remove this Data Template row.",
+            on_click=_dtsel_remove_row,
+            args=(_i,),
+        )
     if _lbl == DT_PLACEHOLDER:
         with _cols[1]:
             st.multiselect(
@@ -4100,39 +4106,6 @@ def all_results_long_df() -> pd.DataFrame:
     return out.reindex(columns=[c for c in cols if c in out.columns])
 
 
-_IV_VALUE_RE = re.compile(r"^(-?\d+(?:[.,]\d+)?)(?:\s*\(([^)]*)\)|\s+(\S[^()]*?))?\s*$")
-
-
-def _parse_interval_label(label: Any) -> tuple[str, str, Any] | None:
-    """Split one resolved interval setpoint into (parameter, unit, value).
-
-        'Temperature: 23 (°C)' -> ('Temperature', '°C', 23)
-        'Time: 0 day'          -> ('Time', 'day', 0)
-        'Time: initial'        -> ('Time', '', 'initial')
-        'ROW3' (unresolved)    -> ('', '', 'ROW3')
-        '' / None              -> None
-
-    The numeric value comes back as int/float so the XLSX can write a REAL
-    number cell (directly usable as a chart axis), with the parameter and unit
-    promoted into the column's sub-header instead of repeating in every cell."""
-    s = str(label or "").strip()
-    if not s:
-        return None
-    name, sep, val = s.partition(":")
-    if sep:
-        name, val = name.strip(), val.strip()
-    else:
-        name, val = "", s
-    m = _IV_VALUE_RE.match(val)
-    if m:
-        num = float(m.group(1).replace(",", "."))
-        if num.is_integer():
-            num = int(num)
-        unit = (m.group(2) if m.group(2) is not None else (m.group(3) or "")).strip()
-        return (name, unit, num)
-    return (name, "", val)
-
-
 def build_xlsx() -> bytes:
     """Report-ready workbook.
 
@@ -4149,9 +4122,9 @@ def build_xlsx() -> bytes:
         and a medium divider between the key block and the value columns;
       * blocks alternate white / pale blue, so neighbouring Data Columns (or
         groups) separate at a glance;
-      * Results interval axes are SPLIT: 'Temperature: 23 (°C)' becomes a real
-        numeric 23 in a cream 'Temperature [°C]' sub-column under the merged
-        'Interval 1' header - chartable directly (see _parse_interval_label).
+      * the Results Interval columns keep their full setpoint labels
+        ('Temperature: 23 (°C)') and are tinted cream, so the axis setpoints
+        stand apart from the rest of the key block without extra columns.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -4196,112 +4169,16 @@ def build_xlsx() -> bytes:
 
     _all_tuples = special_tuples + col_tuples
 
-    # --- Results frame FIRST: splitting its interval axes into numeric
-    # sub-columns widens its key block, which KEY_W below must know about.
-    rdf = results_drilldown_df(
-        loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS,
-        order_table_key="res::merged_by_dt",
-    )
-    if rdf.empty and len(visible_cols) < len(exp_cols_all):
-        rdf = results_drilldown_df(
-            loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS,
-            keep_all_rows=True, order_table_key="res::merged_by_dt",
-        )
-    res_extra: list[tuple[str, str]] = []
-    if not rdf.empty:
-        # the on-screen ticked/applied row selection
-        rrids = [
-            "|".join(str(rdf.iloc[i][k]) for k in MERGE_DT_KEYS) for i in range(len(rdf))
-        ]
-        rdf = _apply_row_selection(rdf, rrids, "res::merged_by_dt")
-        # foreign-experiment columns (only present with include_foreign)
-        res_extra = [
-            t for t in rdf.columns if isinstance(t, tuple) and t not in _all_tuples
-        ]
-
-    hidden_res = hidden_of.get("result_design", set())
-    res_vis_keys = [k for k in MERGE_DT_KEYS if k not in hidden_res]
-
-    # Per visible interval axis: the ordered distinct (parameter, unit) pairs
-    # actually present -> one numeric sub-column each ('Temperature [°C]').
-    # An axis whose labels do not parse (or that is empty) keeps ONE plain
-    # column, so nothing is ever lost to the split.
-    iv_subs: dict[str, list[tuple[str, str]]] = {}
-    for k in res_vis_keys:
-        if not k.startswith("Interval "):
-            continue
-        subs: list[tuple[str, str]] = []
-        if not rdf.empty and k in rdf.columns:
-            for v in rdf[k]:
-                p = _parse_interval_label(v)
-                if p is not None and (p[0], p[1]) not in subs:
-                    subs.append((p[0], p[1]))
-        iv_subs[k] = subs
-
-    # flat expanded key layout: (top header, flat column name, source key, sub)
-    res_layout: list[tuple[str, str, str, tuple[str, str] | None]] = []
-    for k in res_vis_keys:
-        subs = iv_subs.get(k) or []
-        if subs:
-            for nm, un in subs:
-                res_layout.append(
-                    (k, f"{nm} [{un}]" if un else (nm or "Setpoint"), k, (nm, un))
-                )
-        else:
-            res_layout.append((k, k, k, None))
-    res_keys_flat = [nm for _t, nm, _s, _u in res_layout]
-    _kseen: dict[str, int] = {}
-    for _ix, _nm in enumerate(res_keys_flat):  # merge logic needs unique names
-        if _nm in _kseen:
-            _kseen[_nm] += 1
-            res_keys_flat[_ix] = f"{_nm} ({_kseen[_nm]})"
-        else:
-            _kseen[_nm] = 1
-    res_groups: list[list] = []  # [top header, span] for the two-row header
-    for _t, _nm, _s, _u in res_layout:
-        if res_groups and res_groups[-1][0] == _t:
-            res_groups[-1][1] += 1
-        else:
-            res_groups.append([_t, 1])
-    res_parent_names = [src for _t, _nm, src, _u in res_layout]
-    res_num_idxs = {i for i, (_t, _nm, _s, u) in enumerate(res_layout) if u is not None}
-    res_iv_idxs = {
-        i for i, (_t, _nm, src, _u) in enumerate(res_layout) if src.startswith("Interval ")
-    }
-    res_dim_idxs = {i for i, (_t, _nm, src, _u) in enumerate(res_layout) if src == "Unit"}
-    res_block_idx = next(
-        (i for i, (_t, _nm, src, _u) in enumerate(res_layout) if src == "Data Template"),
-        None,
-    )
-    res_band_idx = next(
-        (i for i, (_t, _nm, src, _u) in enumerate(res_layout) if src == "Data Column"),
-        None,
-    )
-
-    def _expand_res_kv(get) -> list:
-        """Base key values -> expanded key cells: the parsed numeric setpoint
-        lands in ITS parameter's sub-column, the other sub-columns stay blank."""
-        out: list = []
-        for _t, _nm, src, sub in res_layout:
-            v = get(src)
-            if sub is None:
-                out.append("" if v is None else v)
-            else:
-                p = _parse_interval_label(v)
-                out.append(p[2] if p is not None and (p[0], p[1]) == sub else "")
-        return out
-
     # --- one key block wide enough for the widest section ---------------------
     # DataTemplate-first: the Results view is ALWAYS merged by DT. Key columns
     # hidden on screen are dropped from that section's key block.
-    per_section_keys = {
-        s["attr"]: key_cols_for(s) for s in sections if s["attr"] != "result_design"
-    }
+    per_section_keys = {s["attr"]: key_cols_for(s) for s in sections}
+    per_section_keys["result_design"] = list(MERGE_DT_KEYS)
     per_section_keys = {
         attr: [k for k in keys if k not in hidden_of.get(attr, set())]
         for attr, keys in per_section_keys.items()
     }
-    KEY_W = max([1, len(res_keys_flat), *(len(v) for v in per_section_keys.values())])
+    KEY_W = max(1, max(len(v) for v in per_section_keys.values()))
     FIRST_EXP = KEY_W + 1  # 1-based column of the first experiment
 
     # Value columns exported = every special/experiment column visible in AT
@@ -4321,19 +4198,16 @@ def build_xlsx() -> bytes:
     STEEL = "8496B0"      # medium borders: section outline / block rules
     GRID = "D5DCE4"       # thin cell grid
     HEAD = "D9E2F1"       # key header fill
-    SUBHEAD = "EAF0F8"    # interval sub-header fill
     BAND = "DDEBF7"       # frozen experiment-code band
     ZEBRA = "F3F7FB"      # alternating block tint
     IV_A, IV_B = "FDF9EC", "F6EFDC"  # interval setpoint columns (both phases)
     bold_w = Font(bold=True, color="FFFFFF", size=11)
     head_f = Font(bold=True, color=NAVY)
-    sub_f = Font(bold=True, size=9, color=NAVY)
     dim_f = Font(size=9, italic=True, color="7F7F7F")  # the Unit key column
     ital = Font(italic=True, size=9, color="555555")
     small = Font(size=9, color="555555")  # experiment names: NO italics
     sect_fill = PatternFill("solid", fgColor=NAVY)
     head_fill = PatternFill("solid", fgColor=HEAD)
-    sub_fill = PatternFill("solid", fgColor=SUBHEAD)
     band_fill = PatternFill("solid", fgColor=BAND)
     zebra_fill = PatternFill("solid", fgColor=ZEBRA)
     iv_fill_a = PatternFill("solid", fgColor=IV_A)
@@ -4373,14 +4247,6 @@ def build_xlsx() -> bytes:
         value=f"Sheet(s): {TITLE_SHEETS}   |   {len(visible_cols)} of {len(exp_cols_all)} "
         f"experiments shown   |   exported {pd.Timestamp.now():%Y-%m-%d %H:%M}",
     ).font = ital
-    if any(iv_subs.values()):
-        ws.cell(
-            row=3,
-            column=1,
-            value="Results: interval setpoints are split into numeric 'parameter "
-            "[unit]' sub-columns under their Interval header - use them directly, "
-            "e.g. as a chart's X axis.",
-        ).font = small
 
     # --- frozen experiment header (ID over description) -----------------------
     HDR = 4
@@ -4443,11 +4309,8 @@ def build_xlsx() -> bytes:
         merge_cols: list[str],
         extra_tuples: list[tuple[str, str]] | None = None,
         image_of=None,
-        key_groups: list[list] | None = None,
-        numeric_idxs: set[int] | None = None,
         iv_idxs: set[int] | None = None,
         dim_idxs: set[int] | None = None,
-        parent_names: list[str] | None = None,
         block_idx: int | None = None,
         band_idx: int | None = None,
     ) -> None:
@@ -4464,22 +4327,13 @@ def build_xlsx() -> bytes:
         empty header-less gap in between.
 
         Styling hooks:
-          key_groups    [[top header, span]] -> TWO header rows: a group whose
-                        span > 1 (or whose single column was renamed) writes
-                        the top header merged over its sub-headers - the
-                        Results interval split - while plain keys merge
-                        vertically over both rows.
-          numeric_idxs  key columns written as real number cells, centred.
-          iv_idxs       key columns tinted cream (interval setpoints).
+          iv_idxs       key columns tinted cream (the Interval setpoints).
           dim_idxs      key columns in small italic grey (the Unit column).
-          parent_names  names fed to the merge hierarchy instead of `keys`, so
-                        interval sub-columns keep 'Interval N' merge semantics.
           block_idx     key column whose value change starts a new BLOCK: a
                         medium rule across the table + the zebra tint flips.
           band_idx      finer banding column (e.g. Data Column inside a DT)."""
         nonlocal r
         extra_tuples = extra_tuples or []
-        numeric_idxs = numeric_idxs or set()
         iv_idxs = iv_idxs or set()
         dim_idxs = dim_idxs or set()
         n_vals = len(EXPORT_TUPLES) + len(extra_tuples)
@@ -4493,52 +4347,19 @@ def build_xlsx() -> bytes:
             ws.cell(row=r, column=cc).fill = sect_fill
         r += 1
 
-        # --- header: one row, or two when an interval axis is split -----------
-        if key_groups:
-            ci = 0
-            for glabel, span in key_groups:
-                c0 = 1 + off + ci
-                subs = keys[ci : ci + span]
-                top = ws.cell(row=r, column=c0, value=glabel)
-                top.font, top.fill, top.border, top.alignment = head_f, head_fill, box, ctr
-                if span > 1 or subs[0] != glabel:
-                    for k2 in range(1, span):
-                        cc2 = ws.cell(row=r, column=c0 + k2)
-                        cc2.fill, cc2.border = head_fill, box
-                    if span > 1:
-                        ws.merge_cells(
-                            start_row=r, start_column=c0, end_row=r, end_column=c0 + span - 1
-                        )
-                    for k2 in range(span):
-                        sc = ws.cell(row=r + 1, column=c0 + k2, value=subs[k2])
-                        sc.font, sc.fill, sc.border, sc.alignment = sub_f, sub_fill, box, ctr
-                else:
-                    b2 = ws.cell(row=r + 1, column=c0)
-                    b2.fill, b2.border = head_fill, box
-                    ws.merge_cells(start_row=r, start_column=c0, end_row=r + 1, end_column=c0)
-                ci += span
-            for rr in (r, r + 1):
-                for j in range(n_vals):
-                    c = ws.cell(row=rr, column=FIRST_EXP + j)
-                    c.fill, c.border = head_fill, box
-            # extra columns exist only in this section - header them here
-            for j, (code, _desc) in enumerate(extra_tuples):
-                c = ws.cell(row=r, column=FIRST_EXP + len(EXPORT_TUPLES) + j, value=code)
-                c.font, c.alignment = head_f, ctr
-            r += 2
-        else:
-            for i, k in enumerate(keys):
-                c = ws.cell(row=r, column=1 + off + i, value=k)
-                c.font, c.fill, c.border, c.alignment = head_f, head_fill, box, lft
-            for j in range(n_vals):
-                c = ws.cell(row=r, column=FIRST_EXP + j)
-                c.fill, c.border = head_fill, box
-            # extra columns exist only in this section - header them here
-            for j, (code, _desc) in enumerate(extra_tuples):
-                c = ws.cell(row=r, column=FIRST_EXP + len(EXPORT_TUPLES) + j, value=code)
-                c.font, c.alignment = head_f, ctr
-            r += 1
-        # medium rule under the header block
+        # --- header row --------------------------------------------------------
+        for i, k in enumerate(keys):
+            c = ws.cell(row=r, column=1 + off + i, value=k)
+            c.font, c.fill, c.border, c.alignment = head_f, head_fill, box, lft
+        for j in range(n_vals):
+            c = ws.cell(row=r, column=FIRST_EXP + j)
+            c.fill, c.border = head_fill, box
+        # extra columns exist only in this section - header them here
+        for j, (code, _desc) in enumerate(extra_tuples):
+            c = ws.cell(row=r, column=FIRST_EXP + len(EXPORT_TUPLES) + j, value=code)
+            c.font, c.alignment = head_f, ctr
+        r += 1
+        # medium rule under the header row
         for cc in range(1 + off, last_col + 1):
             _edge(ws.cell(row=r - 1, column=cc), bottom=med)
 
@@ -4548,9 +4369,8 @@ def build_xlsx() -> bytes:
         prev_block: str | None = None
         prev_band = None
         for keyvals, expvals in rows_iter:
-            kl = list(keyvals)[: len(keys)]
-            kl += [""] * (len(keys) - len(kl))
-            vals = [str(v) for v in kl]
+            vals = [str(v) for v in list(keyvals)[: len(keys)]]
+            vals += [""] * (len(keys) - len(vals))
             keymat.append(vals)
             new_block = (
                 block_idx is not None
@@ -4571,14 +4391,8 @@ def build_xlsx() -> bytes:
             fill_n = zebra_fill if band_on else None
             fill_i = iv_fill_b if band_on else iv_fill_a
             for i in range(len(keys)):
-                v = kl[i]
-                c = ws.cell(
-                    row=r,
-                    column=1 + off + i,
-                    value=v if i in numeric_idxs and isinstance(v, (int, float)) else vals[i],
-                )
-                c.border = box
-                c.alignment = ctr if i in numeric_idxs else lft
+                c = ws.cell(row=r, column=1 + off + i, value=vals[i])
+                c.border, c.alignment = box, lft
                 if i in dim_idxs:
                     c.font = dim_f
                 f = fill_i if i in iv_idxs else fill_n
@@ -4603,9 +4417,8 @@ def build_xlsx() -> bytes:
         # --- real Excel merges on the key columns (same runs as the UI) --------
         idxs = [keys.index(m) for m in merge_cols if m in keys]
         if keymat and idxs:
-            pn = parent_names or keys
             ordered = [[row[i] for i in idxs] for row in keymat]
-            spans = _merge_runs(ordered, len(idxs), _merge_parents([pn[i] for i in idxs]))
+            spans = _merge_runs(ordered, len(idxs), _merge_parents([keys[i] for i in idxs]))
             for rr in range(len(keymat)):
                 for cc, col_i in enumerate(idxs):
                     s = spans[rr][cc]
@@ -4617,7 +4430,7 @@ def build_xlsx() -> bytes:
                             end_column=1 + off + col_i,
                         )
                         mc = ws.cell(row=first_data + rr, column=1 + off + col_i)
-                        mc.alignment = ctr if col_i in numeric_idxs else Alignment(
+                        mc.alignment = Alignment(
                             horizontal="left", vertical="center", wrap_text=True
                         )
 
@@ -4662,14 +4475,42 @@ def build_xlsx() -> bytes:
                 block_idx=keys.index("Group") if "Group" in keys else None,
             )
         else:
-            # rdf was computed (and row-selected) up top - the interval split
-            # derives the key layout from it, and KEY_W depends on that.
+            # EXACTLY the frame shown on screen: same records (the DT panel's
+            # target tasks), same include_foreign choice, same fallback that
+            # keeps property rows visible when column filters hid every carrier.
+            rdf = results_drilldown_df(
+                loaded_recs, include_foreign=include_foreign, group_keys=MERGE_DT_KEYS,
+                order_table_key="res::merged_by_dt",
+            )
+            if rdf.empty and len(visible_cols) < len(exp_cols_all):
+                rdf = results_drilldown_df(
+                    loaded_recs,
+                    include_foreign=include_foreign,
+                    group_keys=MERGE_DT_KEYS,
+                    keep_all_rows=True,
+                    order_table_key="res::merged_by_dt",
+                )
+            extra_tuples: list[tuple[str, str]] = []
+            if not rdf.empty:
+                # the on-screen ticked/applied row selection
+                rrids = [
+                    "|".join(str(rdf.iloc[i][k]) for k in MERGE_DT_KEYS)
+                    for i in range(len(rdf))
+                ]
+                rdf = _apply_row_selection(rdf, rrids, "res::merged_by_dt")
+                # foreign-experiment columns (only present with include_foreign)
+                extra_tuples = [
+                    t
+                    for t in rdf.columns
+                    if isinstance(t, tuple) and t not in _all_tuples
+                ]
+            keys = per_section_keys["result_design"]
+
             # --- downloaded images -> their pivot cells ----------------------
-            # (expanded key tuple, experiment tuple) -> image bytes. Keyed via
-            # the SAME _expand_res_kv as the rows below, so hidden key columns
-            # and the interval split can never desynchronise the lookup. The
-            # pivot pools trials into one cell - the FIRST trial's image
-            # represents it.
+            # (visible key tuple, experiment tuple) -> image bytes. Keyed on
+            # the VISIBLE key columns (a hidden key column is also absent from
+            # the map key, matching write_section's keyvals). The pivot pools
+            # trials into one cell - the FIRST trial's image represents it.
             _img_store_x = st.session_state.get(IMG_STORE_KEY, {})
             img_map: dict[tuple, bytes] = {}
             if _img_store_x and not rdf.empty:
@@ -4684,13 +4525,11 @@ def build_xlsx() -> bytes:
                             _strip_inv(str(_rr["inventory_id"] or "")),
                             "(filtered out / other sheet)",
                         )
-                        _kv = tuple(
-                            str(x)
-                            for x in _expand_res_kv(lambda k, _r2=_rr: _r2.get(k, ""))
+                        img_map.setdefault(
+                            (tuple(str(_rr.get(k, "")) for k in keys), _t), _b
                         )
-                        img_map.setdefault((_kv, _t), _b)
 
-            _cell_tuples = EXPORT_TUPLES + res_extra
+            _cell_tuples = EXPORT_TUPLES + extra_tuples
 
             def _res_image_of(keyvals, j, _m=img_map, _ct=_cell_tuples, _h=hidden):
                 if not _m or j >= len(_ct) or _ct[j][0] in _h:
@@ -4699,14 +4538,14 @@ def build_xlsx() -> bytes:
 
             write_section(
                 s["label"],
-                res_keys_flat,
+                keys,
                 (
                     (
-                        _expand_res_kv(lambda k, _row=row: _row.get(k, "")),
+                        [row.get(k, "") for k in keys],
                         _exp_values(row, hidden)
                         + [
                             _apply_decimals_text(row.get(t, ""), DECIMALS)
-                            for t in res_extra
+                            for t in extra_tuples
                         ],
                     )
                     for _, row in rdf.iterrows()
@@ -4715,17 +4554,15 @@ def build_xlsx() -> bytes:
                 else iter(()),
                 # Merge on all key columns - but only when the on-screen table
                 # has 'Merge cells' ticked.
-                merge_cols=res_keys_flat if merge_this else [],
-                extra_tuples=res_extra,
+                merge_cols=keys if merge_this else [],
+                extra_tuples=extra_tuples,
                 image_of=_res_image_of if img_map else None,
-                # two-row header only when an interval axis actually split
-                key_groups=res_groups if any(iv_subs.values()) else None,
-                numeric_idxs=res_num_idxs,
-                iv_idxs=res_iv_idxs,
-                dim_idxs=res_dim_idxs,
-                parent_names=res_parent_names,
-                block_idx=res_block_idx,
-                band_idx=res_band_idx,
+                # cream Interval columns, dim Unit, DT block rules, per-Data
+                # Column zebra - the setpoint labels stay as-is
+                iv_idxs={i for i, k in enumerate(keys) if k.startswith("Interval ")},
+                dim_idxs={i for i, k in enumerate(keys) if k == "Unit"},
+                block_idx=keys.index("Data Template") if "Data Template" in keys else None,
+                band_idx=keys.index("Data Column") if "Data Column" in keys else None,
             )
 
     # --- widths ---------------------------------------------------------------
