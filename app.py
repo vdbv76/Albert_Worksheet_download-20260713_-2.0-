@@ -1575,6 +1575,18 @@ with f5:
 ADV_ANY = "(any)"
 
 
+def _ss_del(key) -> None:
+    """Delete a session-state key without crashing on Streamlit's iteration /
+    deletion inconsistency: iterating st.session_state can yield widget-backed
+    keys (e.g. a data_editor's) whose backing widget state is already gone, so
+    a plain `del` raises KeyError('st.session_state has no key ...') for a key
+    the loop just saw. Deleting such a key is a no-op anyway - swallow it."""
+    try:
+        del st.session_state[key]
+    except KeyError:
+        pass
+
+
 def _safe_selectbox(label: str, options: list[str], key: str, **kw):
     """selectbox whose stored value is reset when it falls out of `options`
     (cascade child options change when a parent changes - Streamlit would
@@ -1804,7 +1816,7 @@ if _autosel_clicked:
     with st.spinner("Checking which Data Templates contain data (no values downloaded)..."):
         _dts_hit = _dts_with_data()
     for _k in [k for k in st.session_state if str(k).startswith("dtsel::")]:
-        del st.session_state[_k]
+        _ss_del(_k)
     _labels_hit = [_l for _l, _d in _dt_label_of.items() if _d in _dts_hit]
     st.session_state["dtsel_count"] = len(_labels_hit)
     for _j, _l in enumerate(_labels_hit):
@@ -1828,15 +1840,19 @@ def _dtsel_remove_row(i: int) -> None:
     if not (0 <= i < cnt):
         return
     for _k in [k for k in st.session_state if str(k).startswith(f"dtsel::{i}::")]:
-        del st.session_state[_k]
+        _ss_del(_k)
     for _j in range(i + 1, cnt):
         _pre = f"dtsel::{_j}::"
         for _k in [k for k in st.session_state if str(k).startswith(_pre)]:
             _sfx = str(_k)[len(_pre):]
-            _v = st.session_state.pop(_k)
             # button state (::rm) cannot be assigned via session state
-            if _sfx != "rm":
-                st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = _v
+            if _sfx == "rm":
+                _ss_del(_k)
+                continue
+            try:
+                st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = st.session_state.pop(_k)
+            except KeyError:  # same widget-state inconsistency as _ss_del
+                pass
     st.session_state["dtsel_count"] = cnt - 1
 
 # --- deferred prune: runs on the first render where EVERY task behind the
@@ -2460,7 +2476,7 @@ if _adv_section_fields:
             if st.button("🗑️ Remove last filter", key="adv_remove"):
                 _j = adv_count - 1
                 for _k in [k for k in st.session_state if str(k).startswith(f"advf::{_j}::")]:
-                    del st.session_state[_k]
+                    _ss_del(_k)
                 st.session_state["adv_filter_count"] = max(0, adv_count - 1)
                 st.rerun()
 
@@ -2978,7 +2994,7 @@ def show_df(
         Apply) those stale deltas would fight the new input - the checkbox
         appears to bounce back, which is exactly the 'hard to tick' symptom."""
         for _k in [k for k in st.session_state if str(k).startswith(f"ed::{table_key}")]:
-            del st.session_state[_k]
+            _ss_del(_k)
 
     b_sel, c_ro, c_fz, c_mg, c_hide, c_full = st.columns(
         [2.0, 0.9, 1.2, 1.0, 1.9, 0.8]
@@ -3220,13 +3236,17 @@ def show_df(
     ed_key = f"ed::{table_key}::{_sig}"
     ord_key = f"edorder::{table_key}"
     st.session_state[ord_key] = _order
-    # a changed signature orphans the previous editor state - prune it
+    # a changed signature orphans the previous editor state - prune it.
+    # _ss_del, not del: toggling a row-set option (e.g. 'Hide Blank (BLK)
+    # rows') changes the signature while the old editor's widget state may
+    # already be half-dropped - a plain del then raises KeyError on a key the
+    # iteration just returned.
     for _k in [
         k
         for k in st.session_state
         if str(k).startswith(f"ed::{table_key}::") and k != ed_key
     ]:
-        del st.session_state[_k]
+        _ss_del(_k)
 
     def _sync_editor(_ed_key=ed_key, _sel_key=sel_key, _ord_key=ord_key, _tk=table_key) -> None:
         """Runs BEFORE the rerun: persists checkbox ticks and applies '#' row
