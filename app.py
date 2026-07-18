@@ -1575,12 +1575,30 @@ with f5:
 ADV_ANY = "(any)"
 
 
+def _ss_del(key) -> None:
+    """Delete a session-state key without crashing on Streamlit's lookup
+    inconsistencies. Two mechanisms make a plain `del` unsafe:
+      * iterating st.session_state resolves keys through a different path
+        (`_keys()`: old state + new widget state + key/widget-id mapper) than
+        `__delitem__` does, so a half-dropped widget key (e.g. a data_editor's
+        'ed::...' state after its signature changed) can be YIELDED by the
+        loop and still raise KeyError on deletion;
+      * the Streamlit runtime mutates session state from its own thread
+        (SafeSessionState locks per OPERATION, not per loop), so any key list
+        is a snapshot that can go stale before the delete runs.
+    Deleting an already-gone key is a no-op anyway - swallow it."""
+    try:
+        del st.session_state[key]
+    except KeyError:
+        pass
+
+
 def _safe_selectbox(label: str, options: list[str], key: str, **kw):
     """selectbox whose stored value is reset when it falls out of `options`
     (cascade child options change when a parent changes - Streamlit would
     otherwise raise on the stale session_state value)."""
-    if key in st.session_state and st.session_state[key] not in options:
-        del st.session_state[key]
+    if key in st.session_state and st.session_state.get(key) not in options:
+        _ss_del(key)
     return st.selectbox(label, options, key=key, **kw)
 
 
@@ -1588,7 +1606,9 @@ def _safe_multiselect(label: str, options: list[str], key: str, default=None, **
     """multiselect whose stored values are pruned when they fall out of
     `options`; `default` seeds the state only on first render."""
     if key in st.session_state:
-        st.session_state[key] = [v for v in st.session_state[key] if v in options]
+        st.session_state[key] = [
+            v for v in (st.session_state.get(key) or []) if v in options
+        ]
     else:
         st.session_state[key] = [v for v in (default or []) if v in options]
     return st.multiselect(label, options, key=key, **kw)
@@ -1804,7 +1824,7 @@ if _autosel_clicked:
     with st.spinner("Checking which Data Templates contain data (no values downloaded)..."):
         _dts_hit = _dts_with_data()
     for _k in [k for k in st.session_state if str(k).startswith("dtsel::")]:
-        del st.session_state[_k]
+        _ss_del(_k)
     _labels_hit = [_l for _l, _d in _dt_label_of.items() if _d in _dts_hit]
     st.session_state["dtsel_count"] = len(_labels_hit)
     for _j, _l in enumerate(_labels_hit):
@@ -1828,15 +1848,19 @@ def _dtsel_remove_row(i: int) -> None:
     if not (0 <= i < cnt):
         return
     for _k in [k for k in st.session_state if str(k).startswith(f"dtsel::{i}::")]:
-        del st.session_state[_k]
+        _ss_del(_k)
     for _j in range(i + 1, cnt):
         _pre = f"dtsel::{_j}::"
         for _k in [k for k in st.session_state if str(k).startswith(_pre)]:
             _sfx = str(_k)[len(_pre):]
-            _v = st.session_state.pop(_k)
             # button state (::rm) cannot be assigned via session state
-            if _sfx != "rm":
-                st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = _v
+            if _sfx == "rm":
+                _ss_del(_k)
+                continue
+            try:
+                st.session_state[f"dtsel::{_j - 1}::{_sfx}"] = st.session_state.pop(_k)
+            except KeyError:  # same widget-state inconsistency as _ss_del
+                pass
     st.session_state["dtsel_count"] = cnt - 1
 
 # --- deferred prune: runs on the first render where EVERY task behind the
@@ -1952,9 +1976,11 @@ for _i in range(_dtsel_count):
     _dt_id = _dt_label_of[_lbl]
 
     # changing the DT of a row resets its dependent Data Columns / Intervals
+    # (_ss_del: .pop(default) still KeyErrors when the delete half of the
+    # get-then-delete races the runtime thread - the value is unused anyway)
     if st.session_state.get(f"dtsel::{_i}::dt_prev") != _dt_id:
         for _sfx in ("dc", "iv1", "iv2"):
-            st.session_state.pop(f"dtsel::{_i}::{_sfx}", None)
+            _ss_del(f"dtsel::{_i}::{_sfx}")
         st.session_state[f"dtsel::{_i}::dt_prev"] = _dt_id
 
     _dcs = load_dt_definition(client, _dt_id, int(st.session_state.get("dt_cache_bust", 0)))
@@ -2460,7 +2486,7 @@ if _adv_section_fields:
             if st.button("🗑️ Remove last filter", key="adv_remove"):
                 _j = adv_count - 1
                 for _k in [k for k in st.session_state if str(k).startswith(f"advf::{_j}::")]:
-                    del st.session_state[_k]
+                    _ss_del(_k)
                 st.session_state["adv_filter_count"] = max(0, adv_count - 1)
                 st.rerun()
 
@@ -2978,7 +3004,7 @@ def show_df(
         Apply) those stale deltas would fight the new input - the checkbox
         appears to bounce back, which is exactly the 'hard to tick' symptom."""
         for _k in [k for k in st.session_state if str(k).startswith(f"ed::{table_key}")]:
-            del st.session_state[_k]
+            _ss_del(_k)
 
     b_sel, c_ro, c_fz, c_mg, c_hide, c_full = st.columns(
         [2.0, 0.9, 1.2, 1.0, 1.9, 0.8]
@@ -3220,13 +3246,17 @@ def show_df(
     ed_key = f"ed::{table_key}::{_sig}"
     ord_key = f"edorder::{table_key}"
     st.session_state[ord_key] = _order
-    # a changed signature orphans the previous editor state - prune it
+    # a changed signature orphans the previous editor state - prune it.
+    # _ss_del, not del: toggling a row-set option (e.g. 'Hide Blank (BLK)
+    # rows') changes the signature while the old editor's widget state may
+    # already be half-dropped - a plain del then raises KeyError on a key the
+    # iteration just returned.
     for _k in [
         k
         for k in st.session_state
         if str(k).startswith(f"ed::{table_key}::") and k != ed_key
     ]:
-        del st.session_state[_k]
+        _ss_del(_k)
 
     def _sync_editor(_ed_key=ed_key, _sel_key=sel_key, _ord_key=ord_key, _tk=table_key) -> None:
         """Runs BEFORE the rerun: persists checkbox ticks and applies '#' row
