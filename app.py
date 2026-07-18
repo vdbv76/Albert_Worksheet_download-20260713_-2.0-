@@ -1576,11 +1576,17 @@ ADV_ANY = "(any)"
 
 
 def _ss_del(key) -> None:
-    """Delete a session-state key without crashing on Streamlit's iteration /
-    deletion inconsistency: iterating st.session_state can yield widget-backed
-    keys (e.g. a data_editor's) whose backing widget state is already gone, so
-    a plain `del` raises KeyError('st.session_state has no key ...') for a key
-    the loop just saw. Deleting such a key is a no-op anyway - swallow it."""
+    """Delete a session-state key without crashing on Streamlit's lookup
+    inconsistencies. Two mechanisms make a plain `del` unsafe:
+      * iterating st.session_state resolves keys through a different path
+        (`_keys()`: old state + new widget state + key/widget-id mapper) than
+        `__delitem__` does, so a half-dropped widget key (e.g. a data_editor's
+        'ed::...' state after its signature changed) can be YIELDED by the
+        loop and still raise KeyError on deletion;
+      * the Streamlit runtime mutates session state from its own thread
+        (SafeSessionState locks per OPERATION, not per loop), so any key list
+        is a snapshot that can go stale before the delete runs.
+    Deleting an already-gone key is a no-op anyway - swallow it."""
     try:
         del st.session_state[key]
     except KeyError:
@@ -1591,8 +1597,8 @@ def _safe_selectbox(label: str, options: list[str], key: str, **kw):
     """selectbox whose stored value is reset when it falls out of `options`
     (cascade child options change when a parent changes - Streamlit would
     otherwise raise on the stale session_state value)."""
-    if key in st.session_state and st.session_state[key] not in options:
-        del st.session_state[key]
+    if key in st.session_state and st.session_state.get(key) not in options:
+        _ss_del(key)
     return st.selectbox(label, options, key=key, **kw)
 
 
@@ -1600,7 +1606,9 @@ def _safe_multiselect(label: str, options: list[str], key: str, default=None, **
     """multiselect whose stored values are pruned when they fall out of
     `options`; `default` seeds the state only on first render."""
     if key in st.session_state:
-        st.session_state[key] = [v for v in st.session_state[key] if v in options]
+        st.session_state[key] = [
+            v for v in (st.session_state.get(key) or []) if v in options
+        ]
     else:
         st.session_state[key] = [v for v in (default or []) if v in options]
     return st.multiselect(label, options, key=key, **kw)
@@ -1968,9 +1976,11 @@ for _i in range(_dtsel_count):
     _dt_id = _dt_label_of[_lbl]
 
     # changing the DT of a row resets its dependent Data Columns / Intervals
+    # (_ss_del: .pop(default) still KeyErrors when the delete half of the
+    # get-then-delete races the runtime thread - the value is unused anyway)
     if st.session_state.get(f"dtsel::{_i}::dt_prev") != _dt_id:
         for _sfx in ("dc", "iv1", "iv2"):
-            st.session_state.pop(f"dtsel::{_i}::{_sfx}", None)
+            _ss_del(f"dtsel::{_i}::{_sfx}")
         st.session_state[f"dtsel::{_i}::dt_prev"] = _dt_id
 
     _dcs = load_dt_definition(client, _dt_id, int(st.session_state.get("dt_cache_bust", 0)))
