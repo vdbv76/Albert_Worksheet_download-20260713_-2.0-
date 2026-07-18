@@ -78,10 +78,25 @@ v5 changes:
      (their name is shown in their level's cell) and travel with it. The same
      ordering feeds the XLSX export.
 
+v6 changes:
+  1. 'Select all Data Templates with values' button in the DT panel: one
+     lightweight data-exists check per task fills a selector row per
+     data-bearing Data Template, auto-runs Load Data and then prunes the Data
+     Columns / interval setpoints that hold no values.
+  2. Optional 'Load images' button: downloads the image results of the Data
+     Columns selected in the DT panel (signed S3 URLs from the 'result' file
+     namespace). Loaded images render in an image viewer under the Results
+     table - same rows/columns, one photo per cell, openable enlarged - and
+     are embedded INSIDE their result cells in the XLSX export.
+  3. XLSX polish: per-section key columns are right-aligned against the
+     experiment block (empty pad columns sit on the left edge, so no empty
+     header-less columns between e.g. ingredient names and the experiments),
+     and the experiment description row is no longer italic.
+
 Requirements:
-    pip install streamlit albert pandas truststore openpyxl
+    pip install streamlit albert pandas truststore openpyxl pillow
     (Streamlit >= 1.32 recommended - st.popover; older versions fall back to
-    expanders.)
+    expanders. Pillow is needed to embed result images into the XLSX.)
 
 Run:
     streamlit run app.py
@@ -1374,6 +1389,9 @@ for _t in _catalog["tasks"]:
 # already taken by the task-first flow whose records lack dt_id/dc_id/unit_id
 # - bumped to v5 so every stale cache is guaranteed to bust.
 RESULTS_STORE_KEY = "results_store::v5"
+# Downloaded result images: storage key -> raw bytes. Session-lived and shared
+# by the on-screen image viewer and the XLSX export (images are embedded there).
+IMG_STORE_KEY = "img_store::v1"
 _store = st.session_state.setdefault(RESULTS_STORE_KEY, {})
 _valid_task_ids = {t["id"] for t in property_tasks}
 for _tid in [k for k in _store if k not in _valid_task_ids]:
@@ -2070,7 +2088,27 @@ if section_by_attr.get("result_design"):
             "Templates in Results** above - then press Load Data."
         )
 
-    _lc1, _lc2, _lc3 = st.columns([1.5, 1.6, 1.2])
+    # --- image results among the ALREADY-LOADED records of the target tasks,
+    # restricted to the Data Columns picked in the DT panel: the 'Load images'
+    # scope follows the panel's Data Column selection (interval choices are
+    # display filters and do not reduce what is downloaded).
+    _img_keys_wanted: list[str] = []
+    for _tid2 in target_tasks:
+        for _r2 in results_store.get(_tid2, []):
+            if "__error__" in _r2 or not _r2.get("image_key"):
+                continue
+            for _s2 in dt_selectors:
+                if (
+                    (_r2.get("task_id"), _r2.get("block_id")) in _s2["occ"]
+                    and _r2.get("dc_id") in _s2["dc_ids"]
+                ):
+                    if _r2["image_key"] not in _img_keys_wanted:
+                        _img_keys_wanted.append(_r2["image_key"])
+                    break
+    _img_store_ctrl = st.session_state.setdefault(IMG_STORE_KEY, {})
+    _img_missing = [k for k in _img_keys_wanted if k not in _img_store_ctrl]
+
+    _lc1, _lc2, _lc3, _lc4 = st.columns([1.5, 1.6, 1.6, 1.2])
     with _lc1:
         _load_clicked = st.button(
             f"⬇️ Load Data ({len(target_tasks)} task(s))",
@@ -2088,6 +2126,17 @@ if section_by_attr.get("result_design"):
             "workflow interval cache and the results store, then re-fetches.",
         )
     with _lc3:
+        _imgload_clicked = st.button(
+            f"🖼️ Load images ({len(_img_missing)} of {len(_img_keys_wanted)})",
+            disabled=not _img_missing,
+            help="OPTIONAL extra download: fetches the image results of the Data "
+            "Columns selected in the DT panel above (one file per image; "
+            "already-fetched images are kept for the session). Loaded images "
+            "render in the Results section's image viewer and are embedded "
+            "into their cells in the XLSX export. Run Load Data first - the "
+            "image references travel with the property records.",
+        )
+    with _lc4:
         st.session_state["fetch_workers"] = st.number_input(
             "Parallel requests",
             min_value=1,
@@ -2110,6 +2159,57 @@ if section_by_attr.get("result_design"):
     # The download progress bar renders HERE, just below the Load Data button
     # (the fetch itself still runs from the Results section, into this slot).
     RESULTS_PROGRESS_SLOT = st.container()
+
+    def _download_result_images(keys: list[str], progress_host) -> None:
+        """Fetch result images by storage key into IMG_STORE_KEY. Per file:
+        one `files.get_signed_download_url` call (namespace 'result' - the
+        namespace the SDK itself uploads image property data to) and one plain
+        GET of the short-lived S3 URL. The GET goes through `requests`, NOT
+        the Albert session: S3 rejects signed URLs that also carry an
+        Authorization header."""
+        import requests as _requests
+        from concurrent.futures import ThreadPoolExecutor
+
+        try:
+            from albert.resources.files import FileNamespace
+
+            _ns = FileNamespace.RESULT
+        except ImportError:  # older SDK layout - the enum is a str subclass anyway
+            _ns = "result"
+
+        img_store = st.session_state.setdefault(IMG_STORE_KEY, {})
+        todo = [k for k in keys if k not in img_store]
+        if not todo:
+            return
+        workers = int(st.session_state.get("fetch_workers", 16))
+        prog = progress_host.progress(0.0, text=f"Downloading 0/{len(todo)} image(s)...")
+
+        def _one(k: str):
+            try:
+                url = client.files.get_signed_download_url(name=k, namespace=_ns)
+                resp = _requests.get(url, timeout=120)
+                resp.raise_for_status()
+                return k, resp.content, None
+            except Exception as e:  # noqa: BLE001
+                return k, None, f"{type(e).__name__}: {e}"
+
+        done, img_errs = 0, []
+        with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as ex:
+            for k, img_data, err in ex.map(_one, todo):
+                if err:
+                    img_errs.append(f"{k}: {err}")
+                elif img_data:
+                    img_store[k] = img_data
+                done += 1
+                prog.progress(
+                    done / len(todo), text=f"Downloading {done}/{len(todo)} image(s)..."
+                )
+        prog.empty()
+        if img_errs:
+            st.warning(f"{len(img_errs)} image(s) failed to download - e.g. {img_errs[0]}")
+
+    if _imgload_clicked and _img_missing:
+        _download_result_images(_img_missing, RESULTS_PROGRESS_SLOT)
 
     if _reload_clicked:
         st.session_state["dt_cache_bust"] = int(st.session_state.get("dt_cache_bust", 0)) + 1
@@ -3167,6 +3267,25 @@ def _unit_name(col) -> str:
     return str(getattr(u, "name", "") or "")
 
 
+def _image_storage_key(col) -> str:
+    """S3 storage key of an image-type PropertyValue ('' for plain values).
+    Image results carry their file references in the nested PropertyData's
+    s3Key (preview / thumb / original) - `value` holds at most the file name.
+    The SDK uploads image property data to the 'result' file namespace with
+    keys like 'imagedata/original/TAS.../abc.png', so the key alone (plus that
+    namespace) is enough to sign a download URL later. The preview rendition
+    is preferred: big enough to inspect, far smaller than a camera original."""
+    pdat = getattr(col, "property_data", None)
+    sk = getattr(pdat, "storage_key", None)
+    if sk is None:
+        return ""
+    for attr in ("preview", "original", "thumb"):
+        v = getattr(sk, attr, None)
+        if v:
+            return str(v)
+    return ""
+
+
 def _records_from_tpds(
     tpds,
     task_name: str = "",
@@ -3198,7 +3317,8 @@ def _records_from_tpds(
                     continue
                 for col in getattr(trial, "data_columns", None) or []:
                     val = _column_value(col)
-                    if val == "":
+                    img_key = _image_storage_key(col)
+                    if val == "" and not img_key:
                         continue
                     _col_unit = getattr(col, "unit", None)
                     recs.append(
@@ -3228,7 +3348,9 @@ def _records_from_tpds(
                             "raw_interval": raw_iv,
                             "inventory_id": inv_id,
                             "lot_id": lot_id,
-                            "value": val,
+                            # an image result may have no textual value at all
+                            "value": val or ("(image)" if img_key else val),
+                            "image_key": img_key,
                         }
                     )
     return recs
@@ -3721,6 +3843,91 @@ for s in sections:
                 row_ids=rids,
                 order_paths=rpaths,
             )
+
+    # --- 🖼️ image results viewer ---------------------------------------------
+    # Image-type Data Columns render HERE with the same layout as the Results
+    # table (rows = Data Template / Data Column / Interval - plus Trial, so
+    # repeated photos of one property stay on separate rows; columns = the
+    # experiments), each photo inside its own cell. Cells are data-URLs into
+    # the session image store; select a cell and open its overlay (double-click
+    # / Enter) to view the photo enlarged.
+    _img_store_view = st.session_state.get(IMG_STORE_KEY, {})
+    _ildf = results_long_df(loaded_recs)
+    if not _ildf.empty and "image_key" in _ildf.columns:
+        _ildf = _ildf[_ildf["image_key"].fillna("").astype(str) != ""]
+        if not include_foreign and "Visible (passes filters)" in _ildf.columns:
+            _ildf = _ildf[_ildf["Visible (passes filters)"]]
+    else:
+        _ildf = pd.DataFrame()
+    if not _ildf.empty and not _img_store_view:
+        st.caption(
+            f"🖼️ {int(_ildf['image_key'].nunique())} image result(s) available - "
+            "press **Load images** (section 2) to view them here and embed "
+            "them into the XLSX export."
+        )
+    elif not _ildf.empty:
+        import base64
+        import mimetypes
+
+        def _img_data_url(key: str) -> str:
+            b = _img_store_view.get(key)
+            if not b:
+                return ""
+            mime = mimetypes.guess_type(key)[0] or "image/png"
+            return f"data:{mime};base64,{base64.b64encode(b).decode()}"
+
+        _ikeys = ["Data Template", "Data Column", *INTERVAL_KEYS, "Trial"]
+        _img_cells: dict[tuple, dict[str, str]] = {}
+        _exp_seen: set[str] = set()
+        for _, _rr in _ildf.iterrows():
+            _code = str(_rr.get("Experiment") or "")
+            _u = _img_data_url(str(_rr["image_key"]))
+            if not _code or not _u:
+                continue
+            _img_cells.setdefault(
+                tuple(str(_rr.get(k, "")) for k in _ikeys), {}
+            ).setdefault(_code, _u)
+            _exp_seen.add(_code)
+        if _img_cells:
+            # experiment columns in the worksheet's own on-screen order
+            _exp_cols = [t[0] for t in col_tuples if t[0] in _exp_seen]
+            _exp_cols += sorted(_exp_seen - set(_exp_cols))
+            _idf = pd.DataFrame(
+                [
+                    dict(zip(_ikeys, k)) | {c: v.get(c) or None for c in _exp_cols}
+                    for k, v in _img_cells.items()
+                ]
+            )
+            with st.expander(f"🖼️ Images ({len(_idf)} row(s))", expanded=True):
+                if hasattr(st, "column_config") and hasattr(st.column_config, "ImageColumn"):
+                    _icfg = {
+                        c: st.column_config.ImageColumn(
+                            c,
+                            help="Select the cell and open it (double-click / "
+                            "Enter) to view the photo enlarged.",
+                        )
+                        for c in _exp_cols
+                    }
+                    try:  # row_height needs a recent Streamlit; degrade quietly
+                        st.dataframe(
+                            _idf,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config=_icfg,
+                            row_height=96,
+                        )
+                    except TypeError:
+                        st.dataframe(
+                            _idf,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config=_icfg,
+                        )
+                else:
+                    st.info(
+                        "This Streamlit version cannot render image cells - "
+                        "upgrade to >= 1.23 (`pip install -U streamlit`)."
+                    )
     # (the DT index & Load plan diagnostics expander moved to section 2, next
     #  to the load controls)
 
@@ -3755,7 +3962,7 @@ def all_results_long_df() -> pd.DataFrame:
         "Data Template", "Data Column", "Unit",
         *INTERVAL_KEYS, "raw_interval", "Trial",
         "Experiment", "Experiment name", "inventory_id", "lot_id",
-        "Visible (passes filters)", "value",
+        "Visible (passes filters)", "value", "image_key",
     ]
     return out.reindex(columns=[c for c in cols if c in out.columns])
 
@@ -3823,6 +4030,7 @@ def build_xlsx() -> bytes:
     bold_w = Font(bold=True, color="FFFFFF", size=11)
     bold = Font(bold=True)
     ital = Font(italic=True, size=9, color="555555")
+    small = Font(size=9, color="555555")  # experiment names: NO italics
     sect_fill = PatternFill("solid", fgColor=NAVY)
     head_fill = PatternFill("solid", fgColor=GREY)
     band_fill = PatternFill("solid", fgColor=BAND)
@@ -3849,11 +4057,37 @@ def build_xlsx() -> bytes:
         c1.font, c1.alignment, c1.fill, c1.border = bold, ctr, band_fill, box
         if show_desc_row:  # description row mirrors the on-screen toggle
             c2 = ws.cell(row=HDR + 1, column=FIRST_EXP + j, value=desc)
-            c2.font, c2.alignment, c2.border = ital, ctr, box
+            c2.font, c2.alignment, c2.border = small, ctr, box
     ws.cell(row=HDR, column=1, value="Experiment →").font = bold
     ws.freeze_panes = ws.cell(row=HDR + 2, column=FIRST_EXP)
 
     r = HDR + 2
+
+    def _embed_image(*, row: int, col: int, data: bytes) -> bool:
+        """Anchor one downloaded image INSIDE its result cell, scaled to fit
+        the experiment column; the row grows to the image height. openpyxl
+        needs Pillow to read image dimensions - without it (or with an
+        unreadable file) the cell keeps its file-name text instead."""
+        try:
+            from openpyxl.drawing.image import Image as XLImage
+            from PIL import Image as PILImage
+        except ImportError:
+            return False
+        try:
+            w, h = PILImage.open(io.BytesIO(data)).size
+        except Exception:  # noqa: BLE001
+            return False
+        if not w or not h:
+            return False
+        MAXW, MAXH = 108, 82  # px; fits the 16-char experiment column
+        scale = min(MAXW / w, MAXH / h, 1.0)
+        img = XLImage(io.BytesIO(data))
+        img.width, img.height = max(1, int(w * scale)), max(1, int(h * scale))
+        ws.add_image(img, f"{get_column_letter(col)}{row}")
+        # Excel row heights are points (= px * 3/4); keep the tallest image
+        cur = ws.row_dimensions[row].height or 0
+        ws.row_dimensions[row].height = max(cur, img.height * 0.75 + 4)
+        return True
 
     def write_section(
         label: str,
@@ -3861,13 +4095,23 @@ def build_xlsx() -> bytes:
         rows_iter,
         merge_cols: list[str],
         extra_tuples: list[tuple[str, str]] | None = None,
+        image_of=None,
     ) -> None:
         """One section table. `rows_iter` yields (keyvals, expvals) where
         expvals is already aligned to EXPORT_TUPLES (+ extra_tuples appended,
-        e.g. Results' foreign-experiment columns)."""
+        e.g. Results' foreign-experiment columns). `image_of(keyvals, j)` may
+        return downloaded image bytes for value cell j - the image is then
+        embedded in the cell instead of its text.
+
+        Key columns are RIGHT-aligned inside the shared KEY_W block: when this
+        section has fewer key columns than the widest one, the unused pad
+        columns sit on the LEFT edge and stay completely empty (no header, no
+        border), so the key columns always hug the experiment block with no
+        empty header-less gap in between."""
         nonlocal r
         extra_tuples = extra_tuples or []
         n_vals = len(EXPORT_TUPLES) + len(extra_tuples)
+        off = KEY_W - len(keys)  # left pad -> keys end right at FIRST_EXP - 1
         r += 1
         # full-width section banner
         ws.cell(row=r, column=1, value=label.upper()).font = bold_w
@@ -3875,7 +4119,7 @@ def build_xlsx() -> bytes:
             ws.cell(row=r, column=cc).fill = sect_fill
         r += 1
         for i, k in enumerate(keys):
-            c = ws.cell(row=r, column=1 + i, value=k)
+            c = ws.cell(row=r, column=1 + off + i, value=k)
             c.font, c.fill, c.border, c.alignment = bold, head_fill, box, lft
         for j in range(n_vals):
             c = ws.cell(row=r, column=FIRST_EXP + j)
@@ -3889,13 +4133,20 @@ def build_xlsx() -> bytes:
         first_data = r
         keymat: list[list[str]] = []
         for keyvals, expvals in rows_iter:
-            padded = [str(keyvals[i]) if i < len(keyvals) else "" for i in range(KEY_W)]
-            keymat.append(padded)
-            for i in range(KEY_W):
-                c = ws.cell(row=r, column=1 + i, value=padded[i])
+            vals = [str(v) for v in list(keyvals)[: len(keys)]]
+            vals += [""] * (len(keys) - len(vals))
+            keymat.append(vals)
+            for i in range(len(keys)):
+                c = ws.cell(row=r, column=1 + off + i, value=vals[i])
                 c.border, c.alignment = box, lft
             for j, v in enumerate(expvals):
-                c = ws.cell(row=r, column=FIRST_EXP + j, value=_num(v))
+                img_b = image_of(keyvals, j) if image_of else None
+                if img_b is not None and _embed_image(
+                    row=r, col=FIRST_EXP + j, data=img_b
+                ):
+                    c = ws.cell(row=r, column=FIRST_EXP + j, value="")
+                else:
+                    c = ws.cell(row=r, column=FIRST_EXP + j, value=_num(v))
                 c.border, c.alignment = box, ctr
             r += 1
 
@@ -3910,11 +4161,11 @@ def build_xlsx() -> bytes:
                     if s > 1:
                         ws.merge_cells(
                             start_row=first_data + rr,
-                            start_column=1 + col_i,
+                            start_column=1 + off + col_i,
                             end_row=first_data + rr + s - 1,
-                            end_column=1 + col_i,
+                            end_column=1 + off + col_i,
                         )
-                        mc = ws.cell(row=first_data + rr, column=1 + col_i)
+                        mc = ws.cell(row=first_data + rr, column=1 + off + col_i)
                         mc.alignment = Alignment(
                             horizontal="left", vertical="center", wrap_text=True
                         )
@@ -4002,6 +4253,37 @@ def build_xlsx() -> bytes:
                     if isinstance(t, tuple) and t not in _all_tuples
                 ]
             keys = per_section_keys["result_design"]
+
+            # --- downloaded images -> their pivot cells ----------------------
+            # (visible key tuple, experiment tuple) -> image bytes. Keyed on
+            # the VISIBLE key columns (a hidden key column is also absent from
+            # the map key, matching write_section's keyvals). The pivot pools
+            # trials into one cell - the FIRST trial's image represents it.
+            _img_store_x = st.session_state.get(IMG_STORE_KEY, {})
+            img_map: dict[tuple, bytes] = {}
+            if _img_store_x and not rdf.empty:
+                _lx = results_long_df(loaded_recs)
+                if not _lx.empty and "image_key" in _lx.columns:
+                    _lx = _lx[_lx["image_key"].fillna("").astype(str) != ""]
+                    for _, _rr in _lx.iterrows():
+                        _b = _img_store_x.get(str(_rr["image_key"]))
+                        if not _b:
+                            continue
+                        _t = invid_to_tuple.get(_rr["inventory_id"]) or (
+                            _strip_inv(str(_rr["inventory_id"] or "")),
+                            "(filtered out / other sheet)",
+                        )
+                        img_map.setdefault(
+                            (tuple(str(_rr.get(k, "")) for k in keys), _t), _b
+                        )
+
+            _cell_tuples = EXPORT_TUPLES + extra_tuples
+
+            def _res_image_of(keyvals, j, _m=img_map, _ct=_cell_tuples, _h=hidden):
+                if not _m or j >= len(_ct) or _ct[j][0] in _h:
+                    return None
+                return _m.get((tuple(str(v) for v in keyvals), _ct[j]))
+
             write_section(
                 s["label"],
                 keys,
@@ -4022,6 +4304,7 @@ def build_xlsx() -> bytes:
                 # has 'Merge cells' ticked.
                 merge_cols=keys if merge_this else [],
                 extra_tuples=extra_tuples,
+                image_of=_res_image_of if img_map else None,
             )
 
     # --- widths ---------------------------------------------------------------
