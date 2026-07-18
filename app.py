@@ -3869,12 +3869,27 @@ for s in sections:
         import base64
         import mimetypes
 
+        def _img_mime(b: bytes, key: str) -> str:
+            """Content sniffing first (Albert previews are .webp and Python's
+            mimetypes table lacks that extension on some installs), file
+            extension as fallback."""
+            if b[:8] == b"\x89PNG\r\n\x1a\n":
+                return "image/png"
+            if b[:3] == b"\xff\xd8\xff":
+                return "image/jpeg"
+            if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+                return "image/webp"
+            if b[:6] in (b"GIF87a", b"GIF89a"):
+                return "image/gif"
+            if b[:2] == b"BM":
+                return "image/bmp"
+            return mimetypes.guess_type(key)[0] or "image/png"
+
         def _img_data_url(key: str) -> str:
             b = _img_store_view.get(key)
             if not b:
                 return ""
-            mime = mimetypes.guess_type(key)[0] or "image/png"
-            return f"data:{mime};base64,{base64.b64encode(b).decode()}"
+            return f"data:{_img_mime(b, key)};base64,{base64.b64encode(b).decode()}"
 
         _ikeys = ["Data Template", "Data Column", *INTERVAL_KEYS, "Trial"]
         _img_cells: dict[tuple, dict[str, str]] = {}
@@ -4074,11 +4089,26 @@ def build_xlsx() -> bytes:
         except ImportError:
             return False
         try:
-            w, h = PILImage.open(io.BytesIO(data)).size
+            pim = PILImage.open(io.BytesIO(data))
+            w, h = pim.size
         except Exception:  # noqa: BLE001
             return False
         if not w or not h:
             return False
+        # openpyxl writes the image into the archive under its ORIGINAL format
+        # and then maps the extension through Python's mimetypes table - which
+        # has no '.webp' entry on some installs (KeyError on wb.save), and old
+        # Excel builds cannot render webp anyway. Albert previews ARE webp, so
+        # anything that is not PNG/JPEG is re-encoded to PNG here.
+        if (pim.format or "").upper() not in ("PNG", "JPEG"):
+            try:
+                if pim.mode not in ("RGB", "RGBA"):
+                    pim = pim.convert("RGBA")
+                _png = io.BytesIO()
+                pim.save(_png, format="PNG")
+                data = _png.getvalue()
+            except Exception:  # noqa: BLE001
+                return False
         MAXW, MAXH = 108, 82  # px; fits the 16-char experiment column
         scale = min(MAXW / w, MAXH / h, 1.0)
         img = XLImage(io.BytesIO(data))
