@@ -1730,6 +1730,148 @@ _dt_label_of = {
 }
 DT_PLACEHOLDER = "(select a Data Template)"
 
+
+# --- "Select all Data Templates with values" (one-click auto-selection) ------
+# Click -> (1) ONE lightweight `check_for_task_data` call per Property Task
+# (parallel; it returns block x inventory combos with a `data_exists` flag and
+# downloads ZERO property values) finds the Data Templates that actually
+# contain data and fills one selector row per hit; (2) Load Data is triggered
+# automatically for those templates (same fetch the button below would do);
+# (3) once the records are in the store, each row's Data Columns and interval
+# setpoints are pruned to the ones that actually carry values (deferred prune,
+# see `dtsel_autoprune_pending` below).
+def _dts_with_data() -> set[str]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    dt_of_block: dict[tuple[str, str], set[str]] = {}
+    for _dt, _ent in dt_index.items():
+        for _o in _ent["occurrences"]:
+            dt_of_block.setdefault((_o["task_id"], _o["block_id"]), set()).add(_dt)
+    tids = sorted({t for t, _b in dt_of_block})
+    if not tids:
+        return set()
+
+    def _check(tid: str):
+        try:
+            return tid, list(client.property_data.check_for_task_data(task_id=tid)), None
+        except Exception as e:  # noqa: BLE001
+            return tid, [], f"{type(e).__name__}: {e}"
+
+    out: set[str] = set()
+    errs: list[str] = []
+    workers = int(st.session_state.get("fetch_workers", 16))
+    with ThreadPoolExecutor(max_workers=min(workers, len(tids))) as ex:
+        for tid, combos, err in ex.map(_check, tids):
+            if err:
+                errs.append(f"{tid}: {err}")
+                continue
+            for c in combos:
+                # missing flag -> assume data may exist (same default as Load
+                # Data's planner); the deferred prune corrects any over-selection
+                if not getattr(c, "data_exists", True):
+                    continue
+                for _dt in dt_of_block.get((tid, getattr(c, "block_id", "") or ""), ()):
+                    out.add(_dt)
+    if errs:
+        st.warning(f"Data check failed for {len(errs)} task(s) - e.g. {errs[0]}")
+    return out
+
+
+_autosel_clicked = st.button(
+    "⚡ Select all Data Templates with values",
+    key="dtsel_autoselect",
+    disabled=not _dt_label_of,
+    help="One click: finds every Data Template that actually contains property "
+    "data (one lightweight data-exists check per task - no values downloaded), "
+    "fills one selector row per hit, downloads their data (same as Load Data) "
+    "and then unselects the Data Columns / interval setpoints that turned out "
+    "to hold no values. Replaces the rows configured below.",
+)
+if _autosel_clicked:
+    with st.spinner("Checking which Data Templates contain data (no values downloaded)..."):
+        _dts_hit = _dts_with_data()
+    for _k in [k for k in st.session_state if str(k).startswith("dtsel::")]:
+        del st.session_state[_k]
+    _labels_hit = [_l for _l, _d in _dt_label_of.items() if _d in _dts_hit]
+    st.session_state["dtsel_count"] = len(_labels_hit)
+    for _j, _l in enumerate(_labels_hit):
+        st.session_state[f"dtsel::{_j}::dt"] = _l
+    if _labels_hit:
+        st.session_state["dtsel_autoload_pending"] = True
+        st.session_state["dtsel_autoprune_pending"] = True
+    else:
+        st.info("No Data Template in the selected project(s) contains property data.")
+
+# --- deferred prune: runs on the first render where EVERY task behind the
+# selected templates is in the results store (i.e. right after the
+# auto-triggered Load Data finished, or immediately when it was all cached).
+# Computes, per Data Template, which Data Columns and which resolved interval
+# setpoints actually carry values; the row loop below writes that into the
+# widgets' session state BEFORE they are instantiated.
+_dtsel_autoprune = False
+_dt_usage: dict[str, dict] = {}
+if st.session_state.get("dtsel_autoprune_pending"):
+    _sel_ids_now = {
+        _dt_label_of[st.session_state.get(f"dtsel::{_j}::dt")]
+        for _j in range(int(st.session_state.get("dtsel_count", 0)))
+        if st.session_state.get(f"dtsel::{_j}::dt") in _dt_label_of
+    }
+    _needed_tids = {
+        _o["task_id"]
+        for _d in _sel_ids_now
+        for _o in dt_index.get(_d, {}).get("occurrences", [])
+    }
+    _store_now = st.session_state.get(RESULTS_STORE_KEY, {})
+    if _sel_ids_now and _needed_tids <= set(_store_now):
+        st.session_state["dtsel_autoprune_pending"] = False
+        _dtsel_autoprune = True
+        _prune_recs = [
+            _r
+            for _tid in _needed_tids
+            for _r in _store_now.get(_tid, [])
+            if "__error__" not in _r
+        ]
+        # resolve interval tokens with the cached workflow maps (fetch missing)
+        _wf_cache = st.session_state.setdefault("wf_intervals", {})
+        _missing_wids = sorted(
+            {
+                _w
+                for _r in _prune_recs
+                for _w in ([_r.get("workflow_id", "")] + list(_r.get("task_workflows") or []))
+                if _w and _w not in _wf_cache
+            }
+        )
+        if _missing_wids:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(_missing_wids))) as _ex:
+                for _w, _m in zip(
+                    _missing_wids,
+                    _ex.map(lambda w: _workflow_interval_map(client, w), _missing_wids),
+                ):
+                    _wf_cache[_w] = _m
+        for _r in _prune_recs:
+            _d = _r.get("dt_id") or ""
+            if not _d:
+                continue
+            _u = _dt_usage.setdefault(
+                _d, {"dcs": set(), "iv": [set(), set()], "unresolved": False}
+            )
+            if _r.get("dc_id"):
+                _u["dcs"].add(_r["dc_id"])
+            _raw = str(_r.get("raw_interval", "") or "")
+            if _raw:
+                _labels: list[str] = []
+                for _w in [_r.get("workflow_id", "")] + list(_r.get("task_workflows") or []):
+                    if _w and _wf_cache.get(_w, {}).get(_raw):
+                        _labels = _wf_cache[_w][_raw]
+                        break
+                if not _labels:
+                    _u["unresolved"] = True
+                for _ax_j in (0, 1):
+                    if _ax_j < len(_labels) and _labels[_ax_j]:
+                        _u["iv"][_ax_j].add(_labels[_ax_j])
+
 _dtsel_count = int(st.session_state.get("dtsel_count", 0))
 if _dtsel_count == 0:
     if st.button("➕ Add DT", key="dtsel_add_first", disabled=not _dt_label_of):
@@ -1775,6 +1917,12 @@ for _i in range(_dtsel_count):
         for _d in _dcs
     }
     _default_dcs = [_l for _l, _did in _dc_label_of.items() if not _hidden_of.get(_did)]
+    # deferred auto-prune: keep only the Data Columns that actually carry values
+    # (a DT with zero usable records keeps its defaults - never an empty match-all)
+    if _dtsel_autoprune and _dt_id in _dt_usage:
+        st.session_state[f"dtsel::{_i}::dc"] = [
+            _l for _l, _did in _dc_label_of.items() if _did in _dt_usage[_dt_id]["dcs"]
+        ]
     with _cols[1]:
         _sel_dc_labels = _safe_multiselect(
             "Data Columns",
@@ -1802,6 +1950,15 @@ for _i in range(_dtsel_count):
             if _has and len(_ax["names"]) == 1
             else f"Interval {_ax_i + 1}"
         )
+        # deferred auto-prune: select only the setpoints that carry values.
+        # Unresolved tokens or full coverage fall back to an EMPTY selection
+        # ('(any)' - no filter), so pruning can never drop a real record.
+        if _dtsel_autoprune and _dt_id in _dt_usage and _has:
+            _u = _dt_usage[_dt_id]
+            _keep = [_v2 for _v2 in _ax["values"] if _v2 in _u["iv"][_ax_i]]
+            if _u["unresolved"] or len(_keep) == len(_ax["values"]):
+                _keep = []
+            st.session_state[f"dtsel::{_i}::iv{_ax_i + 1}"] = _keep
         with _cols[2 + _ax_i]:
             _v = _safe_multiselect(
                 _iv_label,
@@ -1941,6 +2098,14 @@ if section_by_attr.get("result_design"):
             "block x inventory combo of the SELECTED Data Templates, across all "
             "target tasks at once. Raising this shortens the load; back off on errors.",
         )
+
+    # "Select all Data Templates with values" also presses Load Data itself:
+    # the flag is consumed exactly once; with everything already cached there
+    # is nothing to fetch and the prune above has already run on this render.
+    if st.session_state.get("dtsel_autoload_pending"):
+        st.session_state["dtsel_autoload_pending"] = False
+        if _results_to_fetch:
+            _load_clicked = True
 
     # The download progress bar renders HERE, just below the Load Data button
     # (the fetch itself still runs from the Results section, into this slot).
